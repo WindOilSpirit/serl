@@ -1,0 +1,117 @@
+spacemouse_franka_teleop_test:
+  ros__parameters:
+    target_topic: /spacemouse_franka_teleop/action
+    deadman_topic: /spacemouse_franka_teleop/deadman
+    retreat_topic: /spacemouse_franka_teleop/retreat
+    fine_mode_topic: /spacemouse_franka_teleop/fine_mode
+    controller_manager_service: /controller_manager/list_controllers
+    controller_name: serl_cartesian_impedance_controller
+    require_active_controller: false
+    frame_id: base
+    rate_hz: 50.0
+    log_rate_hz: 2.0
+    debug_simulation_mode: false
+
+    # SpaceMouse Compact typically exposes two buttons.
+    # Hold deadman to send actions. Hold fine simultaneously for fine speed.
+    deadman_button_index: 0
+    fine_button_index: 1
+    retreat_button_index: -1
+    command_start_hold_s: 0.4
+
+    debug_force_deadman_after_sec: 0.0
+    debug_z_input_after_deadman_sec: 4.0
+    debug_z_input_value: 0.15
+    debug_z_input_duration_sec: 2.0
+    debug_z_input_ramp_s: 0.4
+    debug_z_oscillation_mode: false
+    debug_z_cycle_period_s: 6.0
+    debug_z_cycle_delay_s: 0.5
+    debug_z_cycle_value: 0.15
+    axis_sign: [1.0, 1.0, 1.0]
+
+spacemouse_franka_impedance_teleop_server:
+  ros__parameters:
+    action_topic: /spacemouse_franka_teleop/action
+    deadman_topic: /spacemouse_franka_teleop/deadman
+    fine_mode_topic: /spacemouse_franka_teleop/fine_mode
+    target_pose_topic: /serl_cartesian_impedance_controller/target_pose
+    measured_pose_topic: /franka_robot_state_broadcaster/current_pose
+    external_wrench_topic: /franka_robot_state_broadcaster/external_wrench_in_stiffness_frame
+    server_status_topic: /spacemouse_franka_teleop/server_status
+    controller_manager_service: /controller_manager/list_controllers
+    controller_name: serl_cartesian_impedance_controller
+    require_active_controller: true
+    publish_enabled: true
+    debug_simulation_mode: false
+    fake_measured_pose_when_debug: false
+    frame_id: base
+    rate_hz: 250.0
+    log_rate_hz: 2.0
+    debug_csv_path: /tmp/spacemouse_franka_impedance_trace.csv
+
+    command_timeout_s: 0.20
+    measured_pose_timeout_s: 0.20
+    speed_scale: 1.0
+    spacemouse_target_scale: 1.0
+    normal_spacemouse_target_scale: 2.0
+    fine_spacemouse_target_scale: 1.0
+    translation_deadzone: 0.06
+    rotation_deadzone: 0.10
+    input_power: 3.0
+    max_action_norm: 1.0
+
+    coarse_v_xy_max: 0.003
+    coarse_v_z_up_max: 0.003
+    coarse_v_z_down_max: 0.001
+    coarse_a_xy_max: 0.010
+    coarse_a_z_up_max: 0.010
+    coarse_a_z_down_max: 0.003
+    coarse_j_xy_max: 0.100
+    coarse_j_z_up_max: 0.100
+    coarse_j_z_down_max: 0.030
+
+    fine_v_xy_max: 0.001
+    fine_v_z_up_max: 0.001
+    fine_v_z_down_max: 0.0005
+    fine_a_xy_max: 0.004
+    fine_a_z_up_max: 0.004
+    fine_a_z_down_max: 0.0015
+    fine_j_xy_max: 0.040
+    fine_j_z_up_max: 0.040
+    fine_j_z_down_max: 0.015
+
+    d_move: 3.0
+    d_stop: 5.0
+    dt_nominal: 0.004
+    dt_max: 0.020
+    delta_xy_max: 0.000020
+    delta_z_up_max: 0.000020
+    delta_z_down_max: 0.000010
+    workspace_slowdown_distance: 0.030
+    workspace_low: [0.25, -0.20, 0.04]
+    workspace_high: [0.75, 0.25, 0.75]
+
+spacemouse_franka_impedance_dashboard:
+  ros__parameters:
+    action_topic: /spacemouse_franka_teleop/action
+    deadman_topic: /spacemouse_franka_teleop/deadman
+    fine_mode_topic: /spacemouse_franka_teleop/fine_mode
+    target_pose_topic: /serl_cartesian_impedance_controller/target_pose
+    measured_pose_topic: /franka_robot_state_broadcaster/current_pose
+    controller_raw_target_pose_topic: /serl_cartesian_impedance_controller/debug/raw_target_pose
+    controller_smoothed_target_pose_topic: /serl_cartesian_impedance_controller/debug/smoothed_target_pose
+    controller_clipped_target_pose_topic: /serl_cartesian_impedance_controller/debug/clipped_target_pose
+    controller_measured_pose_topic: /serl_cartesian_impedance_controller/debug/measured_pose
+    controller_status_topic: /serl_cartesian_impedance_controller/debug/status
+    server_status_topic: /spacemouse_franka_teleop/server_status
+    external_wrench_topic: /franka_robot_state_broadcaster/external_wrench_in_stiffness_frame
+    controller_manager_service: /controller_manager/list_controllers
+    controller_name: serl_cartesian_impedance_controller
+    display_rate_hz: 5.0
+    stale_timeout_s: 0.5
+    project_dir: /home/admin123/WenshuoZhou/SERL/Code/spacemouse_franka_teleop_test
+    log_dir: /tmp/spacemouse_franka_teleop_logs
+    clear_script: scripts/clear_ros.sh
+    controller_start_script: scripts/start_serl_cartesian_controller.sh
+    teleop_start_script: scripts/run_teleop.sh

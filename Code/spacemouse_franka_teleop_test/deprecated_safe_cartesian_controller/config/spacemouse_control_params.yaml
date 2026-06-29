@@ -1,0 +1,321 @@
+spacemouse_franka_pose_action_server:
+  ros__parameters:
+    # ============================================================
+    # SpaceMouse -> target_pose 中间整形参数
+    # ============================================================
+    #
+    # 当前控制链路：
+    #   SpaceMouse
+    #   -> teleop_node 发布归一化输入 raw_action, 范围约 [-1, 1]
+    #   -> pose_action_server 生成 target_pose
+    #   -> serl_safe_cartesian_pose_controller
+    #
+    # 重要原则：
+    #   1. SpaceMouse 输入不是速度命令，而是“加速度意图”。
+    #   2. target_pose 由 pose_action_server 内部积分生成。
+    #   3. 第一版只控制 x/y/z 平移；姿态始终固定/跟随当前 Franka 姿态。
+    #
+    # 每个 1 kHz 控制周期中的主要计算过程：
+    #
+    #   raw_action
+    #     -> deadzone:
+    #          abs(u) <= translation_deadzone 时 u = 0
+    #
+    #     -> deadzone 后重新归一化:
+    #          abs(raw) <= deadzone 时 u = 0
+    #          否则 u = sign(raw) * (abs(raw) - deadzone) / (1 - deadzone)
+    #
+    #     -> power scaling:
+    #          u_scaled = sign(u) * abs(u)^input_power
+    #
+    #     -> action norm limit:
+    #          如果 ||u_scaled|| > max_action_norm，则整体缩放到 max_action_norm
+    #
+    #     -> workspace slow-down:
+    #          靠近 workspace 边界时，将对应方向的加速度意图逐渐缩小
+    #
+    #     -> user acceleration:
+    #          x/y: a_user = coarse_or_fine_a_xy_max * u_scaled
+    #          z_up:   a_user_z = coarse_or_fine_a_z_up_max   * u_scaled_z
+    #          z_down: a_user_z = coarse_or_fine_a_z_down_max * u_scaled_z
+    #
+    #     -> damping / brake:
+    #          deadman 按下:
+    #            a_des = a_user - d_move * v_cmd
+    #          deadman 松开或 HOLD/BRAKE:
+    #            a_des = -d_stop * v_cmd
+    #
+    #     -> acceleration limit:
+    #          a_des 被限制在各轴 a_max 范围内
+    #
+    #     -> velocity soft saturation:
+    #          靠近 v_max 时提前缩小 a_des，避免速度撞到上限后硬截断
+    #
+    #     -> jerk limit:
+    #          da = clamp(a_des - a_cmd, -j_max * dt, +j_max * dt)
+    #          a_cmd = a_cmd + da
+    #
+    #     -> velocity integration:
+    #          v_cmd = v_cmd + a_cmd * dt
+    #
+    #     -> velocity limit:
+    #          v_cmd 被限制在各轴 v_max 范围内
+    #
+    #     -> target delta:
+    #          delta_position = v_cmd * dt
+    #
+    #     -> per-step delta limit:
+    #          delta_position 被限制在 delta_*_max 范围内
+    #
+    #     -> final target:
+    #          target_pose.position = target_pose.position + delta_position
+    #          target_pose.orientation = current_pose.orientation
+    #
+    # 缩放关系：
+    #   effective_scale = control_scale * speed_scale
+    #
+    # 其中 speed_scale 是 launch 命令行临时覆盖参数，默认 1.0。
+    # control_scale 是这里的总缩放参数。
+    #
+    # 当前代码中 effective_scale 只缩放运动能力上限：
+    #   - v_xy / v_z_up / v_z_down
+    #   - a_xy / a_z_up / a_z_down
+    #   - j_xy / j_z_up / j_z_down
+    #
+    # 注意：
+    #   d_move / d_stop / delta_* 不再乘 control_scale。
+    #   飞行器式控制的近似稳态速度 v ~= a_user / d_move；
+    #   如果 a_max 和 d_move 同时放大，稳态速度不会真正增加。
+    control_scale: 1.0
+
+    # ============================================================
+    # 输入整形参数
+    # ============================================================
+
+    # 平移 deadzone，无单位。
+    # 作用：过滤 SpaceMouse 静止时的小漂移。
+    # 计算：
+    #   abs(raw_x/y/z) <= translation_deadzone 时，该轴输入置 0；
+    #   否则先重新归一化到 [0, 1]，再进行 input_power 幂次整形。
+    # 调大：更不容易误动，但小输入响应变迟钝。
+    # 调小：更灵敏，但可能引入静止漂移。
+    translation_deadzone: 0.04
+
+    # 输入幂次整形指数，无单位。
+    # 计算：u_scaled = sign(u) * abs(u)^input_power。
+    # 作用：调节 SpaceMouse 小输入的细腻程度。
+    # input_power=2.0 比 cubic=3.0 更不容易把小输入压到 e-5 速度量级。
+    input_power: 2.0
+
+    # 旋转 deadzone，无单位。
+    # 当前第一版不控制姿态，roll/pitch/yaw 不参与 target_pose 生成。
+    # 该参数目前只用于读取并整形旋转输入，保留给后续姿态控制版本。
+    rotation_deadzone: 0.10
+
+    # 三轴输入整体范数限制，无单位。
+    # 作用：防止 x/y/z 同时大输入时合成加速度过大。
+    # 计算：如果 ||u_scaled|| > max_action_norm，则：
+    #       u_scaled = u_scaled * max_action_norm / ||u_scaled||
+    max_action_norm: 1.0
+
+    # action 超时时间，单位 s。
+    # 作用：如果 pose_action_server 超过该时间没收到 teleop_node 的新指令，
+    #       则不继续认为 deadman 指令有效，进入 brake/hold 逻辑。
+    # 调小：通信中断时更快刹停。
+    # 调大：对偶发延迟更宽容。
+    command_timeout_s: 0.10
+
+    # Franka current_pose 新鲜度超时时间，单位 s。
+    # 作用：如果 robot_state/current_pose 长时间没有更新，server 不继续积分 target。
+    robot_state_timeout_s: 0.10
+
+    # Franka last_desired_pose 新鲜度超时时间，单位 s。
+    # last_desired_pose 是 Franka 状态里的 O_T_EE_d，代表底层上一期望/命令位姿；
+    # 真机安全版本只把它作为诊断信息，不作为 measured pose、sync pose 或 tracking reference。
+    command_pose_timeout_s: 0.25
+
+    # last_desired_pose 只作为诊断字段保留。
+    # target 初始化不使用 measured_pose，也不使用 last_desired_pose；
+    # deadman 上升沿的第一帧 bottom target 必须来自
+    # /serl_safe_cartesian_pose_controller/debug/internal_command_pose。
+
+    # deadman 上升沿允许进入 HUMAN_CONTROL 的 command-measured 最大误差，单位 m。
+    # measured_pose 是真实安全参考；controller_internal_command_pose 是底层连续性参考。
+    # 若两者差值超过该阈值，server 不发布 target，回到 IDLE/WAITING 状态。
+    tracking_start_tolerance: 0.0005
+
+    # 是否真正发布到 /serl_safe_cartesian_pose_controller/target_pose。
+    # 最小排查测试 1：
+    #   publish_enabled=false 时，只记录 internal_target，不向 controller 发命令。
+    #   如果 internal_target 仍跳，问题在 robot server 内部；
+    #   如果 internal_target 不跳，问题在发布链路、多 publisher 或 controller 层。
+    publish_enabled: true
+
+    # 强制零运动测试开关。
+    # 最小排查测试 2：
+    #   force_zero_motion=true 时，即使 teleop/deadman 有输入，也不积分速度/加速度。
+    #   可用于验证 published target 是否仍然跳变。
+    force_zero_motion: false
+
+    # target 写入/发布 trace CSV。
+    # 每行记录 internal_target、pre/post guard target、published_target、measured_current、
+    # target_write_reason 和 target_writer。
+    # 留空 "" 可关闭；当前为排查 target 跳变默认开启。
+    debug_csv_path: /tmp/spacemouse_franka_target_trace.csv
+
+    # ============================================================
+    # Coarse mode 限制
+    # ============================================================
+    #
+    # coarse 是默认控制模式，速度/加速度/jerk 通常比 fine 大。
+    # 以下原始值还会乘 effective_scale。
+    #
+    # Franka 官方笛卡尔平移限制：
+    #   速度 3.0 m/s，加速度 9.0 m/s^2，jerk 4500 m/s^3。
+    # 本文件参数应远低于官方极限。
+
+    # x/y 最大速度，单位 m/s。
+    # 实际上限：coarse_v_xy_max * effective_scale。
+    # 作用：限制 target_pose 在水平面的最大移动速度。
+    coarse_v_xy_max: 0.005
+
+    # z 向上最大速度，单位 m/s。
+    # 实际上限：coarse_v_z_up_max * effective_scale。
+    # 作用：限制 target_pose 上升速度。
+    coarse_v_z_up_max: 0.003
+
+    # z 向下最大速度，单位 m/s。
+    # 实际上限：coarse_v_z_down_max * effective_scale。
+    # 作用：限制 target_pose 下降速度；通常建议小于 z_up，更保守。
+    coarse_v_z_down_max: 0.001
+
+    # x/y 最大加速度，单位 m/s^2。
+    # 实际上限：coarse_a_xy_max * effective_scale。
+    # 作用：决定 SpaceMouse 输入推动水平速度变化的快慢。
+    coarse_a_xy_max: 0.008
+
+    # z 向上最大加速度，单位 m/s^2。
+    # 实际上限：coarse_a_z_up_max * effective_scale。
+    # 作用：决定向上速度建立得多快。
+    coarse_a_z_up_max: 0.006
+
+    # z 向下最大加速度，单位 m/s^2。
+    # 实际上限：coarse_a_z_down_max * effective_scale。
+    # 作用：决定向下速度建立得多快；通常建议小于 z_up，更保守。
+    coarse_a_z_down_max: 0.002
+
+    # x/y 最大 jerk，单位 m/s^3。
+    # 实际上限：coarse_j_xy_max * effective_scale。
+    # 作用：限制 a_cmd 每周期变化量，保证起步/反向/刹停平滑。
+    coarse_j_xy_max: 0.05
+
+    # z 向上最大 jerk，单位 m/s^3。
+    # 实际上限：coarse_j_z_up_max * effective_scale。
+    # 作用：限制向上加速度变化速度。
+    coarse_j_z_up_max: 0.03
+
+    # z 向下最大 jerk，单位 m/s^3。
+    # 实际上限：coarse_j_z_down_max * effective_scale。
+    # 作用：限制向下加速度变化速度；通常建议比 z_up 小。
+    coarse_j_z_down_max: 0.02
+
+    # ============================================================
+    # Fine mode 限制
+    # ============================================================
+    #
+    # fine 是精细控制模式，按住 fine 按键时使用。
+    # 以下原始值同样会乘 effective_scale。
+
+    # fine 模式 x/y 最大速度，单位 m/s。
+    fine_v_xy_max: 0.0015
+
+    # fine 模式 z 向上最大速度，单位 m/s。
+    fine_v_z_up_max: 0.001
+
+    # fine 模式 z 向下最大速度，单位 m/s。
+    fine_v_z_down_max: 0.0005
+
+    # fine 模式 x/y 最大加速度，单位 m/s^2。
+    fine_a_xy_max: 0.003
+
+    # fine 模式 z 向上最大加速度，单位 m/s^2。
+    fine_a_z_up_max: 0.002
+
+    # fine 模式 z 向下最大加速度，单位 m/s^2。
+    fine_a_z_down_max: 0.001
+
+    # fine 模式 x/y 最大 jerk，单位 m/s^3。
+    fine_j_xy_max: 0.020
+
+    # fine 模式 z 向上最大 jerk，单位 m/s^3。
+    fine_j_z_up_max: 0.015
+
+    # fine 模式 z 向下最大 jerk，单位 m/s^3。
+    fine_j_z_down_max: 0.010
+
+    # ============================================================
+    # 阻尼 / 刹停参数
+    # ============================================================
+
+    # deadman 按下、人工控制时的运动阻尼，单位 s^-1。
+    # 实际值：d_move；不乘 control_scale。
+    # 计算：a_des = a_user - d_move * v_cmd。
+    # 作用：让速度不会无限积累，并形成“推 SpaceMouse 加速，松手自然减速”的手感。
+    # 调大：速度更难积累，松手后更快回落，手感更“粘”。
+    # 调小：速度更容易积累，手感更“滑”。
+    d_move: 1.5
+
+    # deadman 松开、HOLD/BRAKE 或急停式刹车时的停止阻尼，单位 s^-1。
+    # 实际值：d_stop；不乘 control_scale。
+    # 计算：a_des = -d_stop * v_cmd。
+    # 作用：不直接把 v_cmd 置零，而是通过 jerk limit 平滑刹停。
+    # 调大：刹停更快，但加速度变化需求更大。
+    # 调小：刹停更柔和，但滑行更久。
+    d_stop: 3.0
+
+    # ============================================================
+    # dt 时间保护
+    # ============================================================
+
+    # 名义控制周期，单位 s。
+    # 当前目标是 1000 Hz，所以 dt_nominal = 0.001。
+    # 当实际 dt 异常或超过 dt_max 时，用 dt_nominal 积分，避免一次异常周期造成 target 跳变。
+    dt_nominal: 0.001
+
+    # 最大允许积分周期，单位 s。
+    # 如果实际 dt > dt_max，则认为该周期 stale，使用 dt_nominal 代替。
+    dt_max: 0.003
+
+    # ============================================================
+    # 单周期 target_pose 增量限制
+    # ============================================================
+    #
+    # delta_position = v_cmd * dt 后，还会被以下参数限制。
+    # 以下值不乘 control_scale，始终是单周期绝对硬上限。
+    # 作用：即使速度/时间异常，也限制每个控制周期 target_pose 最多移动多少。
+
+    # x/y 每周期最大位移，单位 m。
+    delta_xy_max: 0.00001
+
+    # z 向上每周期最大位移，单位 m。
+    delta_z_up_max: 0.00001
+
+    # z 向下每周期最大位移，单位 m。
+    # 通常建议小于 z_up，更保守。
+    delta_z_down_max: 0.000003
+
+    # ============================================================
+    # workspace / tracking 安全参数
+    # ============================================================
+
+    # 当前最小控制版本暂时不使用 slowdown zone。
+    # 越界方向会清零该轴 delta/速度；该字段保留给后续恢复边界减速逻辑。
+    workspace_slowdown_distance: 0.030
+
+    # x/y tracking error 上限，单位 m。
+    # 当前最小控制版本只记录 tracking 诊断，不用它切换 latch 状态。
+    tracking_xy_error_max: 0.002
+
+    # z tracking error 上限，单位 m。
+    # 当前最小控制版本只记录 tracking 诊断，不用它切换 latch 状态。
+    tracking_z_error_max: 0.001

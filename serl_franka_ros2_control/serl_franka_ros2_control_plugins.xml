@@ -1,0 +1,18 @@
+<library path="serl_franka_ros2_control">
+  <class
+    name="serl_franka_ros2_control/SerlCartesianImpedanceController"
+    type="serl_franka_ros2_control::SerlCartesianImpedanceController"
+    base_class_type="controller_interface::ControllerInterface">
+    <description>
+      SERL-style Cartesian impedance torque controller with realtime reference limiting for Franka ROS2.
+    </description>
+  </class>
+  <class
+    name="serl_franka_ros2_control/JointSineTorqueTestController"
+    type="serl_franka_ros2_control::JointSineTorqueTestController"
+    base_class_type="controller_interface::ControllerInterface">
+    <description>
+      Minimal guarded joint effort sine controller for Franka ROS2 effort-path debugging.
+    </description>
+  </class>
+</library>

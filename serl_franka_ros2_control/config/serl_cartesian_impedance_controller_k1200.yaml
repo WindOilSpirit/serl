@@ -1,0 +1,46 @@
+/**:
+  controller_manager:
+    ros__parameters:
+      update_rate: 1000
+
+      serl_cartesian_impedance_controller:
+        type: serl_franka_ros2_control/SerlCartesianImpedanceController
+
+/**:
+  serl_cartesian_impedance_controller:
+    ros__parameters:
+      arm_id: "fr3"
+      target_topic: "/serl_cartesian_impedance_controller/target_pose"
+      use_robot_state_q_dq: true
+      enable_nullspace_torque: false
+      reference_limit_mode: "per_axis_error_clip"
+
+      translational_stiffness: 1200.0
+      rotational_stiffness: 40.0
+      translational_damping: 40.0
+      rotational_damping: 8.0
+      translational_Ki: 0.0
+      rotational_Ki: 0.0
+
+      max_pos_error: 0.002
+      max_ori_error: 0.10
+      translational_clip_neg_x: 0.01
+      translational_clip_neg_y: 0.01
+      translational_clip_neg_z: 0.01
+      translational_clip_x: 0.01
+      translational_clip_y: 0.01
+      translational_clip_z: 0.01
+      rotational_clip_neg_x: 0.05
+      rotational_clip_neg_y: 0.05
+      rotational_clip_neg_z: 0.05
+      rotational_clip_x: 0.05
+      rotational_clip_y: 0.05
+      rotational_clip_z: 0.05
+      filter_coeff: 0.005
+      watchdog_timeout_sec: 0.25
+
+      nullspace_stiffness: 10.0
+      joint1_nullspace_stiffness: 10.0
+      torque_rate_limit: 1.0
+
+      debug_publish_rate: 50.0

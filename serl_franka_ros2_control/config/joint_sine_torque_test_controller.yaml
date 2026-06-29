@@ -1,0 +1,18 @@
+/**:
+  controller_manager:
+    ros__parameters:
+      update_rate: 1000
+
+      joint_sine_torque_test_controller:
+        type: serl_franka_ros2_control/JointSineTorqueTestController
+
+/**:
+  joint_sine_torque_test_controller:
+    ros__parameters:
+      arm_id: "fr3"
+      joint_number: 4
+      amplitude_nm: 0.05
+      frequency_hz: 0.2
+      start_delay_s: 2.0
+      duration_s: 3.0
+      debug_publish_rate: 100.0

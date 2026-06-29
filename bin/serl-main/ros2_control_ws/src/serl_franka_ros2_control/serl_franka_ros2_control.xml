@@ -1,0 +1,18 @@
+<library path="serl_franka_ros2_control">
+  <class
+    name="serl_franka_ros2_control/SafeCartesianPoseController"
+    type="serl_franka_ros2_control::SafeCartesianPoseController"
+    base_class_type="controller_interface::ControllerInterface">
+    <description>
+      Cartesian pose controller for SERL with target subscription and watchdog.
+    </description>
+  </class>
+  <class
+    name="serl_franka_ros2_control/SafeCartesianVelocityController"
+    type="serl_franka_ros2_control::SafeCartesianVelocityController"
+    base_class_type="controller_interface::ControllerInterface">
+    <description>
+      Cartesian velocity controller for SERL with target subscription and watchdog.
+    </description>
+  </class>
+</library>

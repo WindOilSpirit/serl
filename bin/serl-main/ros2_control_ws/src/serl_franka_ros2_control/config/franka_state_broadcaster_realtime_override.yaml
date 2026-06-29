@@ -1,0 +1,5 @@
+/**:
+  franka_robot_state_broadcaster:
+    ros__parameters:
+      lock_log_error: false
+      lock_update_success: true
