@@ -14,7 +14,10 @@ from pathlib import Path
 import numpy as np
 import pinocchio as pin
 
-from .motion_shaping import AxisMotionLimits, MotionShaper, MotionShapingConfig, StepDeltaLimits
+from .motion_shaping import (
+    MotionShaper,
+    build_sim_motion_shaper,
+)
 
 
 DEFAULT_Q = np.array(
@@ -235,45 +238,7 @@ class SpaceMouseReader:
 
 
 def make_default_shaper() -> MotionShaper:
-    coarse = AxisMotionLimits(
-        v_xy=0.005,
-        v_z_up=0.003,
-        v_z_down=0.001,
-        a_xy=0.008,
-        a_z_up=0.006,
-        a_z_down=0.002,
-        j_xy=0.050,
-        j_z_up=0.030,
-        j_z_down=0.020,
-    )
-    fine = AxisMotionLimits(
-        v_xy=0.0015,
-        v_z_up=0.001,
-        v_z_down=0.0005,
-        a_xy=0.003,
-        a_z_up=0.002,
-        a_z_down=0.001,
-        j_xy=0.020,
-        j_z_up=0.015,
-        j_z_down=0.010,
-    )
-    return MotionShaper(
-        MotionShapingConfig(
-            speed_scale=1.0,
-            translation_deadzone=0.04,
-            rotation_deadzone=0.10,
-            input_power=2.0,
-            max_action_norm=1.0,
-            coarse_limits=coarse,
-            fine_limits=fine,
-            d_move=1.5,
-            d_stop=3.0,
-            dt_nominal=0.001,
-            dt_max=0.003,
-            delta_limits=StepDeltaLimits(xy=0.000010, z_up=0.000010, z_down=0.000003),
-            workspace_slowdown_distance=0.030,
-        )
-    )
+    return build_sim_motion_shaper()
 
 
 def load_model(urdf_path: Path) -> tuple[pin.Model, pin.Data, int]:

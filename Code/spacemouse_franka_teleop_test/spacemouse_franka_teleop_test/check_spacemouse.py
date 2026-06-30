@@ -19,11 +19,19 @@ def main() -> None:
             while True:
                 state = device.read()
                 if state is not None:
+                    raw = np.array(
+                        [state.x, state.y, state.z, state.roll, state.pitch, state.yaw],
+                        dtype=np.float64,
+                    )
                     action = np.array(
                         [-state.y, state.x, state.z, -state.roll, -state.pitch, -state.yaw],
                         dtype=np.float64,
                     )
-                    print(f"action={action} buttons={state.buttons}")
+                    print(
+                        "raw=[x y z roll pitch yaw]="
+                        f"{raw} mapped_action=[x y z roll pitch yaw]={action} "
+                        f"buttons={state.buttons}"
+                    )
                 time.sleep(0.1)
         except KeyboardInterrupt:
             pass

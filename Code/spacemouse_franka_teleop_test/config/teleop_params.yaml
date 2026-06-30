@@ -20,14 +20,17 @@ spacemouse_franka_teleop_test:
     command_start_hold_s: 0.4
 
     debug_force_deadman_after_sec: 0.0
-    debug_z_input_after_deadman_sec: 4.0
+    debug_z_input_after_deadman_sec: 0.0
     debug_z_input_value: 0.15
-    debug_z_input_duration_sec: 2.0
+    debug_z_input_duration_sec: 0.0
     debug_z_input_ramp_s: 0.4
     debug_z_oscillation_mode: false
     debug_z_cycle_period_s: 6.0
     debug_z_cycle_delay_s: 0.5
     debug_z_cycle_value: 0.15
+    # Signed 1-based raw pyspacemouse axis map:
+    # raw=[x,y,z,roll,pitch,yaw], command=[-raw_y, raw_x, raw_z, -raw_roll, -raw_pitch, -raw_yaw].
+    spacemouse_axis_map: [-2, 1, 3, -4, -5, -6]
     axis_sign: [1.0, 1.0, 1.0]
 
 spacemouse_franka_impedance_teleop_server:
@@ -49,10 +52,18 @@ spacemouse_franka_impedance_teleop_server:
     rate_hz: 250.0
     log_rate_hz: 2.0
     debug_csv_path: /tmp/spacemouse_franka_impedance_trace.csv
-
     command_timeout_s: 0.20
     measured_pose_timeout_s: 0.20
-    speed_scale: 1.0
+    direct_target_mode: true
+    direct_target_normal_speed: 0.03
+    direct_target_fine_speed: 0.01
+
+    # Legacy motion-shaping parameters. They are ignored while
+    # direct_target_mode is true; archived defaults are in
+    # config/archive/teleop_motion_shaping_mode_legacy.yaml.
+    # effective scale = speed_scale * spacemouse_target_scale *
+    #   (normal_spacemouse_target_scale or fine_spacemouse_target_scale)
+    speed_scale: 10.0
     spacemouse_target_scale: 1.0
     normal_spacemouse_target_scale: 2.0
     fine_spacemouse_target_scale: 1.0
@@ -61,15 +72,15 @@ spacemouse_franka_impedance_teleop_server:
     input_power: 3.0
     max_action_norm: 1.0
 
-    coarse_v_xy_max: 0.003
-    coarse_v_z_up_max: 0.003
-    coarse_v_z_down_max: 0.001
-    coarse_a_xy_max: 0.010
-    coarse_a_z_up_max: 0.010
-    coarse_a_z_down_max: 0.003
-    coarse_j_xy_max: 0.100
-    coarse_j_z_up_max: 0.100
-    coarse_j_z_down_max: 0.030
+    coarse_v_xy_max: 0.03
+    coarse_v_z_up_max: 0.03
+    coarse_v_z_down_max: 0.02
+    coarse_a_xy_max: 0.10
+    coarse_a_z_up_max: 0.10
+    coarse_a_z_down_max: 0.03
+    coarse_j_xy_max: 1
+    coarse_j_z_up_max: 1
+    coarse_j_z_down_max: 3
 
     fine_v_xy_max: 0.001
     fine_v_z_up_max: 0.001
@@ -85,9 +96,9 @@ spacemouse_franka_impedance_teleop_server:
     d_stop: 5.0
     dt_nominal: 0.004
     dt_max: 0.020
-    delta_xy_max: 0.000020
-    delta_z_up_max: 0.000020
-    delta_z_down_max: 0.000010
+    delta_xy_max: 0.00020
+    delta_z_up_max: 0.00020
+    delta_z_down_max: 0.00020
     workspace_slowdown_distance: 0.030
     workspace_low: [0.25, -0.20, 0.04]
     workspace_high: [0.75, 0.25, 0.75]

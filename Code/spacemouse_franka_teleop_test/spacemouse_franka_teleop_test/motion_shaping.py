@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""Pure flight-style motion shaping for SpaceMouse Cartesian teleoperation."""
+"""Velocity-based target generation for SpaceMouse Cartesian teleoperation."""
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from rclpy.node import Node
 
 
 @dataclass
@@ -97,6 +101,84 @@ class MotionStepResult:
     jerk_limited: np.ndarray
     velocity_limited: np.ndarray
     delta_limited: np.ndarray
+    user_velocity: np.ndarray
+    desired_velocity: np.ndarray
+
+
+TARGET_GENERATION_PARAMETER_DEFAULTS: dict[str, object] = {
+    "speed_scale": 1.0,
+    "spacemouse_target_scale": 1.0,
+    "normal_spacemouse_target_scale": 2.0,
+    "fine_spacemouse_target_scale": 1.0,
+    "translation_deadzone": 0.06,
+    "rotation_deadzone": 0.10,
+    "input_power": 3.0,
+    "max_action_norm": 1.0,
+    "coarse_v_xy_max": 0.003,
+    "coarse_v_z_up_max": 0.003,
+    "coarse_v_z_down_max": 0.001,
+    "coarse_a_xy_max": 0.010,
+    "coarse_a_z_up_max": 0.010,
+    "coarse_a_z_down_max": 0.003,
+    "coarse_j_xy_max": 0.100,
+    "coarse_j_z_up_max": 0.100,
+    "coarse_j_z_down_max": 0.030,
+    "fine_v_xy_max": 0.001,
+    "fine_v_z_up_max": 0.001,
+    "fine_v_z_down_max": 0.0005,
+    "fine_a_xy_max": 0.004,
+    "fine_a_z_up_max": 0.004,
+    "fine_a_z_down_max": 0.0015,
+    "fine_j_xy_max": 0.040,
+    "fine_j_z_up_max": 0.040,
+    "fine_j_z_down_max": 0.015,
+    "d_move": 3.0,
+    "d_stop": 5.0,
+    "dt_nominal": 0.004,
+    "dt_max": 0.020,
+    "delta_xy_max": 0.000020,
+    "delta_z_up_max": 0.000020,
+    "delta_z_down_max": 0.000010,
+    "workspace_slowdown_distance": 0.030,
+    "workspace_low": [0.25, -0.20, 0.04],
+    "workspace_high": [0.75, 0.25, 0.75],
+}
+
+SIM_MOTION_SHAPING_DEFAULTS: dict[str, object] = {
+    "speed_scale": 1.0,
+    "translation_deadzone": 0.04,
+    "rotation_deadzone": 0.10,
+    "input_power": 2.0,
+    "max_action_norm": 1.0,
+    "coarse_limits": AxisMotionLimits(
+        v_xy=0.005,
+        v_z_up=0.003,
+        v_z_down=0.001,
+        a_xy=0.008,
+        a_z_up=0.006,
+        a_z_down=0.002,
+        j_xy=0.050,
+        j_z_up=0.030,
+        j_z_down=0.020,
+    ),
+    "fine_limits": AxisMotionLimits(
+        v_xy=0.0015,
+        v_z_up=0.001,
+        v_z_down=0.0005,
+        a_xy=0.003,
+        a_z_up=0.002,
+        a_z_down=0.001,
+        j_xy=0.020,
+        j_z_up=0.015,
+        j_z_down=0.010,
+    ),
+    "d_move": 1.5,
+    "d_stop": 3.0,
+    "dt_nominal": 0.001,
+    "dt_max": 0.003,
+    "delta_limits": StepDeltaLimits(xy=0.000010, z_up=0.000010, z_down=0.000003),
+    "workspace_slowdown_distance": 0.030,
+}
 
 
 def deadzone_normalized(value: float, deadzone: float) -> float:
@@ -115,8 +197,97 @@ def power_deadzone(value: float, deadzone: float, power: float) -> float:
     return math.copysign(abs(shaped), normalized)
 
 
+def declare_target_generation_parameters(node: "Node") -> None:
+    for name, default in TARGET_GENERATION_PARAMETER_DEFAULTS.items():
+        if isinstance(default, list):
+            node.declare_parameter(name, list(default))
+        else:
+            node.declare_parameter(name, default)
+
+
+def get_target_generation_config(node: "Node") -> MotionShapingConfig:
+    def limits(prefix: str) -> AxisMotionLimits:
+        return AxisMotionLimits(
+            v_xy=float(node.get_parameter(f"{prefix}_v_xy_max").value),
+            v_z_up=float(node.get_parameter(f"{prefix}_v_z_up_max").value),
+            v_z_down=float(node.get_parameter(f"{prefix}_v_z_down_max").value),
+            a_xy=float(node.get_parameter(f"{prefix}_a_xy_max").value),
+            a_z_up=float(node.get_parameter(f"{prefix}_a_z_up_max").value),
+            a_z_down=float(node.get_parameter(f"{prefix}_a_z_down_max").value),
+            j_xy=float(node.get_parameter(f"{prefix}_j_xy_max").value),
+            j_z_up=float(node.get_parameter(f"{prefix}_j_z_up_max").value),
+            j_z_down=float(node.get_parameter(f"{prefix}_j_z_down_max").value),
+        )
+
+    return MotionShapingConfig(
+        speed_scale=effective_target_generation_scale(node, False),
+        translation_deadzone=float(node.get_parameter("translation_deadzone").value),
+        rotation_deadzone=float(node.get_parameter("rotation_deadzone").value),
+        input_power=float(node.get_parameter("input_power").value),
+        max_action_norm=float(node.get_parameter("max_action_norm").value),
+        coarse_limits=limits("coarse"),
+        fine_limits=limits("fine"),
+        d_move=float(node.get_parameter("d_move").value),
+        d_stop=float(node.get_parameter("d_stop").value),
+        dt_nominal=float(node.get_parameter("dt_nominal").value),
+        dt_max=float(node.get_parameter("dt_max").value),
+        delta_limits=StepDeltaLimits(
+            xy=float(node.get_parameter("delta_xy_max").value),
+            z_up=float(node.get_parameter("delta_z_up_max").value),
+            z_down=float(node.get_parameter("delta_z_down_max").value),
+        ),
+        workspace_slowdown_distance=float(node.get_parameter("workspace_slowdown_distance").value),
+    )
+
+
+def build_motion_shaper(node: "Node") -> "MotionShaper":
+    return MotionShaper(get_target_generation_config(node))
+
+
+def effective_target_generation_scale(node: "Node", fine_mode: bool) -> float:
+    speed_scale = float(node.get_parameter("speed_scale").value)
+    global_scale = float(node.get_parameter("spacemouse_target_scale").value)
+    mode_scale_name = (
+        "fine_spacemouse_target_scale" if fine_mode else "normal_spacemouse_target_scale"
+    )
+    mode_scale = float(node.get_parameter(mode_scale_name).value)
+    return max(0.0, speed_scale * global_scale * mode_scale)
+
+
+def refresh_motion_shaper_scale(node: "Node", motion_shaper: "MotionShaper", fine_mode: bool) -> None:
+    motion_shaper.config.speed_scale = effective_target_generation_scale(node, fine_mode)
+
+
+def get_workspace_bounds(node: "Node") -> tuple[np.ndarray, np.ndarray]:
+    low = np.asarray(node.get_parameter("workspace_low").value, dtype=np.float64)
+    high = np.asarray(node.get_parameter("workspace_high").value, dtype=np.float64)
+    return low, high
+
+
+def build_sim_motion_shaper() -> "MotionShaper":
+    return MotionShaper(
+        MotionShapingConfig(
+            speed_scale=float(SIM_MOTION_SHAPING_DEFAULTS["speed_scale"]),
+            translation_deadzone=float(SIM_MOTION_SHAPING_DEFAULTS["translation_deadzone"]),
+            rotation_deadzone=float(SIM_MOTION_SHAPING_DEFAULTS["rotation_deadzone"]),
+            input_power=float(SIM_MOTION_SHAPING_DEFAULTS["input_power"]),
+            max_action_norm=float(SIM_MOTION_SHAPING_DEFAULTS["max_action_norm"]),
+            coarse_limits=SIM_MOTION_SHAPING_DEFAULTS["coarse_limits"],
+            fine_limits=SIM_MOTION_SHAPING_DEFAULTS["fine_limits"],
+            d_move=float(SIM_MOTION_SHAPING_DEFAULTS["d_move"]),
+            d_stop=float(SIM_MOTION_SHAPING_DEFAULTS["d_stop"]),
+            dt_nominal=float(SIM_MOTION_SHAPING_DEFAULTS["dt_nominal"]),
+            dt_max=float(SIM_MOTION_SHAPING_DEFAULTS["dt_max"]),
+            delta_limits=SIM_MOTION_SHAPING_DEFAULTS["delta_limits"],
+            workspace_slowdown_distance=float(
+                SIM_MOTION_SHAPING_DEFAULTS["workspace_slowdown_distance"]
+            ),
+        )
+    )
+
+
 class MotionShaper:
-    """Convert normalized SpaceMouse acceleration intent into target-position deltas."""
+    """Convert normalized SpaceMouse intent into target-position deltas."""
 
     def __init__(self, config: MotionShapingConfig) -> None:
         self.config = config
@@ -160,7 +331,6 @@ class MotionShaper:
         input_after_deadzone, scaled_action, u_norm_before_clip, u_norm_after_clip = (
             self._scaled_action_with_debug(action)
         )
-        workspace_scale = np.ones(3, dtype=np.float64)
         z_direction_reference = (
             scaled_action[2] if abs(float(scaled_action[2])) > 1e-12 else self.cmd_velocity[2]
         )
@@ -190,20 +360,22 @@ class MotionShaper:
             dtype=np.float64,
         )
 
-        user_acceleration = np.zeros(3, dtype=np.float64)
+        direction = scaled_action if deadman_active else -self.cmd_velocity
+        workspace_scale = self._workspace_slowdown_scale(
+            target_position, direction, workspace_low, workspace_high
+        )
+        desired_velocity = np.zeros(3, dtype=np.float64)
         if deadman_active:
-            user_acceleration = self._action_to_user_acceleration(
+            desired_velocity = self._action_to_user_velocity(
                 scaled_action, limits, workspace_scale
             )
-        damping = self.config.d_move if deadman_active else self.config.d_stop
-        desired_acceleration = user_acceleration - max(0.0, damping) * self.cmd_velocity
-        pre_accel_limit_desired = desired_acceleration.copy()
-        desired_acceleration = self._limit_axis_acceleration(desired_acceleration, limits)
-        accel_limited = np.abs(pre_accel_limit_desired - desired_acceleration) > 1e-15
-        velocity_saturation_scale = self._velocity_saturation_scale(
-            desired_acceleration, limits
-        )
-        desired_acceleration *= velocity_saturation_scale
+        desired_velocity = self._limit_axis_velocity(desired_velocity, limits)
+        user_velocity = desired_velocity.copy()
+
+        old_velocity = self.cmd_velocity.copy()
+        raw_acceleration = (desired_velocity - old_velocity) / dt_used
+        desired_acceleration = self._limit_axis_acceleration(raw_acceleration, limits)
+        accel_limited = np.abs(raw_acceleration - desired_acceleration) > 1e-15
 
         acceleration_delta = desired_acceleration - self.cmd_acceleration
         limited_acceleration_delta = self._limit_axis_jerk_delta(
@@ -215,11 +387,16 @@ class MotionShaper:
         self.cmd_acceleration = self._limit_axis_acceleration(self.cmd_acceleration, limits)
         accel_limited |= np.abs(pre_cmd_accel_limit - self.cmd_acceleration) > 1e-15
 
-        self.cmd_velocity += self.cmd_acceleration * dt_used
-        pre_velocity_limit_velocity = self.cmd_velocity.copy()
-        self.cmd_velocity = self._limit_axis_velocity(self.cmd_velocity, limits)
+        candidate_velocity = old_velocity + self.cmd_acceleration * dt_used
+        candidate_velocity = self._avoid_velocity_target_overshoot(
+            old_velocity, candidate_velocity, desired_velocity
+        )
+        pre_velocity_limit_velocity = candidate_velocity.copy()
+        self.cmd_velocity = self._limit_axis_velocity(candidate_velocity, limits)
         post_velocity_limit_velocity = self.cmd_velocity.copy()
         velocity_limited = np.abs(pre_velocity_limit_velocity - post_velocity_limit_velocity) > 1e-15
+        self.cmd_acceleration = (self.cmd_velocity - old_velocity) / dt_used
+        desired_acceleration = self.cmd_acceleration.copy()
 
         pre_guard_velocity = self.cmd_velocity.copy()
         raw_delta_position = self.cmd_velocity * dt_used
@@ -234,10 +411,7 @@ class MotionShaper:
         self.cmd_velocity[workspace_clamped] = 0.0
         self.cmd_acceleration[workspace_clamped] = 0.0
         post_guard_target = target_position + delta_position
-        if max(0.0, self.config.d_move) > 1e-12:
-            steady_velocity_estimate = user_acceleration / self.config.d_move
-        else:
-            steady_velocity_estimate = np.full(3, np.nan, dtype=np.float64)
+
         return MotionStepResult(
             delta_position=delta_position,
             dt_used=dt_used,
@@ -258,16 +432,18 @@ class MotionShaper:
             active_velocity_limits=active_velocity_limits,
             active_acceleration_limits=active_acceleration_limits,
             active_jerk_limits=active_jerk_limits,
-            user_acceleration=user_acceleration,
+            user_acceleration=raw_acceleration,
             desired_acceleration=desired_acceleration,
-            steady_velocity_estimate=steady_velocity_estimate,
-            velocity_saturation_scale=velocity_saturation_scale,
+            steady_velocity_estimate=desired_velocity,
+            velocity_saturation_scale=workspace_scale,
             pre_velocity_limit_velocity=pre_velocity_limit_velocity,
             post_velocity_limit_velocity=post_velocity_limit_velocity,
             accel_limited=accel_limited,
             jerk_limited=jerk_limited,
             velocity_limited=velocity_limited,
             delta_limited=delta_limited,
+            user_velocity=user_velocity,
+            desired_velocity=desired_velocity,
         )
 
     def _effective_dt(self, dt: float) -> tuple[float, bool]:
@@ -310,15 +486,15 @@ class MotionShaper:
         u_norm_after_clip = float(np.linalg.norm(processed))
         return input_after_deadzone, processed, u_norm_before_clip, u_norm_after_clip
 
-    def _action_to_user_acceleration(
+    def _action_to_user_velocity(
         self, scaled_action: np.ndarray, limits: AxisMotionLimits, workspace_scale: np.ndarray
     ) -> np.ndarray:
-        acceleration = np.zeros(3, dtype=np.float64)
-        acceleration[0] = scaled_action[0] * limits.a_xy
-        acceleration[1] = scaled_action[1] * limits.a_xy
-        z_limit = limits.a_z_up if scaled_action[2] >= 0.0 else limits.a_z_down
-        acceleration[2] = scaled_action[2] * z_limit
-        return acceleration * workspace_scale
+        velocity = np.zeros(3, dtype=np.float64)
+        velocity[0] = scaled_action[0] * limits.v_xy
+        velocity[1] = scaled_action[1] * limits.v_xy
+        z_limit = limits.v_z_up if scaled_action[2] >= 0.0 else limits.v_z_down
+        velocity[2] = scaled_action[2] * z_limit
+        return velocity * workspace_scale
 
     def _workspace_slowdown_scale(
         self,
@@ -348,54 +524,6 @@ class MotionShaper:
         limited[2] = float(np.clip(limited[2], -limits.v_z_down, limits.v_z_up))
         return limited
 
-    def _velocity_saturation_scale(
-        self, desired_acceleration: np.ndarray, limits: AxisMotionLimits
-    ) -> np.ndarray:
-        lower_velocity = np.array(
-            [-limits.v_xy, -limits.v_xy, -limits.v_z_down],
-            dtype=np.float64,
-        )
-        upper_velocity = np.array(
-            [limits.v_xy, limits.v_xy, limits.v_z_up],
-            dtype=np.float64,
-        )
-        scale = np.ones(3, dtype=np.float64)
-        for i in range(3):
-            if desired_acceleration[i] > 0.0:
-                headroom = upper_velocity[i] - self.cmd_velocity[i]
-                band = self._velocity_soft_band(i, True, limits)
-                scale[i] = self._smoothstep01(headroom / band)
-            elif desired_acceleration[i] < 0.0:
-                headroom = self.cmd_velocity[i] - lower_velocity[i]
-                band = self._velocity_soft_band(i, False, limits)
-                scale[i] = self._smoothstep01(headroom / band)
-        return scale
-
-    def _velocity_soft_band(
-        self, axis: int, positive_direction: bool, limits: AxisMotionLimits
-    ) -> float:
-        if axis < 2:
-            acceleration_limit = limits.a_xy
-            reducing_jerk_limit = limits.j_xy
-        elif positive_direction:
-            acceleration_limit = limits.a_z_up
-            reducing_jerk_limit = limits.j_z_down
-        else:
-            acceleration_limit = limits.a_z_down
-            reducing_jerk_limit = limits.j_z_up
-
-        if positive_direction:
-            acceleration_limit = max(acceleration_limit, self.cmd_acceleration[axis])
-        else:
-            acceleration_limit = max(acceleration_limit, -self.cmd_acceleration[axis])
-        reducing_jerk_limit = max(1e-9, reducing_jerk_limit)
-        return max(1e-9, acceleration_limit * acceleration_limit / (2.0 * reducing_jerk_limit))
-
-    @staticmethod
-    def _smoothstep01(value: float) -> float:
-        x = float(np.clip(value, 0.0, 1.0))
-        return x * x * (3.0 - 2.0 * x)
-
     def _limit_axis_acceleration(
         self, acceleration: np.ndarray, limits: AxisMotionLimits
     ) -> np.ndarray:
@@ -415,6 +543,18 @@ class MotionShaper:
         limited[0] = float(np.clip(limited[0], -xy_delta, xy_delta))
         limited[1] = float(np.clip(limited[1], -xy_delta, xy_delta))
         limited[2] = float(np.clip(limited[2], -z_down_delta, z_up_delta))
+        return limited
+
+    @staticmethod
+    def _avoid_velocity_target_overshoot(
+        old_velocity: np.ndarray, candidate_velocity: np.ndarray, desired_velocity: np.ndarray
+    ) -> np.ndarray:
+        limited = candidate_velocity.copy()
+        for i in range(3):
+            if old_velocity[i] <= desired_velocity[i] <= candidate_velocity[i]:
+                limited[i] = desired_velocity[i]
+            elif old_velocity[i] >= desired_velocity[i] >= candidate_velocity[i]:
+                limited[i] = desired_velocity[i]
         return limited
 
     def _limit_step_delta(self, delta: np.ndarray) -> np.ndarray:

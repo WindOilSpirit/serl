@@ -76,6 +76,17 @@ export COLCON_PREFIX_PATH="$(strip_missing_path_entries "${COLCON_PREFIX_PATH:-}
 export LD_LIBRARY_PATH="$(strip_missing_path_entries "${LD_LIBRARY_PATH:-}")"
 export LD_LIBRARY_PATH="/usr/lib/x86_64-linux-gnu:/usr/local/lib:${LD_LIBRARY_PATH:-}"
 
+# The current /home/admin123/ros2_ws franka_hardware build references fmt::v12
+# but does not declare libfmt.so.12 as a direct NEEDED dependency. Preload only
+# that library instead of reintroducing the full conda runtime into LD_LIBRARY_PATH.
+FMT12_LIBRARY="${FMT12_LIBRARY:-/home/admin123/miniforge3/lib/libfmt.so.12}"
+if [ -f "${FMT12_LIBRARY}" ]; then
+  case ":${LD_PRELOAD:-}:" in
+    *":${FMT12_LIBRARY}:"*) ;;
+    *) export LD_PRELOAD="${FMT12_LIBRARY}${LD_PRELOAD:+:${LD_PRELOAD}}" ;;
+  esac
+fi
+
 if [ -f "${SERL_WORKSPACE}/.venv/bin/activate" ]; then
   source "${SERL_WORKSPACE}/.venv/bin/activate"
 fi

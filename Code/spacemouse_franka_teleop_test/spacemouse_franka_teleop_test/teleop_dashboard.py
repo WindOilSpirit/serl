@@ -22,6 +22,7 @@ import numpy as np
 import rclpy
 from controller_manager_msgs.srv import ListControllers
 from geometry_msgs.msg import PoseStamped, TwistStamped, WrenchStamped
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from std_msgs.msg import Bool, String
@@ -36,6 +37,19 @@ PROJECT_DIR = Path(
 DEFAULT_LOG_DIR = Path("/tmp/spacemouse_franka_teleop_logs")
 RECORD_PERIOD_S = 0.02
 POSE_FIELD_NAMES = ("x", "y", "z", "qx", "qy", "qz", "qw")
+CONTROLLER_DEBUG_RECORD_FIELDS = [
+    "control_law_mode",
+    *(f"position_error_{axis}" for axis in ("x", "y", "z")),
+    *(f"cartesian_force_{axis}" for axis in ("x", "y", "z")),
+    *(f"cartesian_torque_{axis}" for axis in ("x", "y", "z")),
+    *(f"desired_wrench_{axis}" for axis in ("x", "y", "z")),
+    *(f"desired_wrench_torque_{axis}" for axis in ("x", "y", "z")),
+    *(f"wrench_est_{axis}" for axis in ("x", "y", "z")),
+    *(f"wrench_est_torque_{axis}" for axis in ("x", "y", "z")),
+    "wrench_est_error_norm",
+    *(f"tau_task_{index}" for index in range(1, 8)),
+    *(f"tau_command_{index}" for index in range(1, 8)),
+]
 RECORD_HEADER = [
     "frame",
     "time_unix_s",
@@ -85,6 +99,7 @@ RECORD_HEADER = [
     "jerk_limited",
     "step_limited",
     "commanded_torque_norm",
+    *CONTROLLER_DEBUG_RECORD_FIELDS,
     "external_force_norm",
     "external_torque_norm",
     "server_status",
@@ -1088,6 +1103,7 @@ class DashboardApp:
             s.controller_status.get("jerk_limited", ""),
             s.controller_status.get("step_limited", ""),
             s.controller_status.get("commanded_torque_norm", ""),
+            *[s.controller_status.get(field, "") for field in CONTROLLER_DEBUG_RECORD_FIELDS],
             s.server_status.get("external_force_norm", ""),
             s.server_status.get("external_torque_norm", ""),
             s.server_status_raw,
@@ -1124,7 +1140,13 @@ def main() -> None:
     state = DashboardState()
     node = DashboardNode(state)
 
-    spin_thread = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)
+    def spin_node() -> None:
+        try:
+            rclpy.spin(node)
+        except (ExternalShutdownException, KeyboardInterrupt):
+            pass
+
+    spin_thread = threading.Thread(target=spin_node, daemon=True)
     spin_thread.start()
 
     root = tk.Tk()

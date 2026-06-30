@@ -17,15 +17,12 @@ from rclpy.qos import qos_profile_sensor_data
 from std_msgs.msg import Bool, String
 
 from .motion_shaping import (
-    AxisMotionLimits,
-    MotionShaper,
-    MotionShapingConfig,
-    StepDeltaLimits,
+    build_motion_shaper,
+    declare_target_generation_parameters,
+    effective_target_generation_scale,
+    get_workspace_bounds,
+    refresh_motion_shaper_scale,
 )
-
-
-def get_array(node: Node, name: str) -> np.ndarray:
-    return np.asarray(node.get_parameter(name).value, dtype=np.float64)
 
 
 def pose_to_array(msg: PoseStamped) -> np.ndarray:
@@ -98,48 +95,12 @@ class ImpedanceTeleopServer(Node):
         self.declare_parameter("rate_hz", 250.0)
         self.declare_parameter("log_rate_hz", 2.0)
         self.declare_parameter("debug_csv_path", "/tmp/spacemouse_franka_impedance_trace.csv")
-
-        self.declare_parameter("speed_scale", 1.0)
-        self.declare_parameter("spacemouse_target_scale", 1.0)
-        self.declare_parameter("normal_spacemouse_target_scale", 2.0)
-        self.declare_parameter("fine_spacemouse_target_scale", 1.0)
-        self.declare_parameter("translation_deadzone", 0.06)
-        self.declare_parameter("rotation_deadzone", 0.10)
-        self.declare_parameter("input_power", 3.0)
-        self.declare_parameter("max_action_norm", 1.0)
+        declare_target_generation_parameters(self)
+        self.declare_parameter("direct_target_mode", True)
+        self.declare_parameter("direct_target_normal_speed", 0.03)
+        self.declare_parameter("direct_target_fine_speed", 0.01)
         self.declare_parameter("command_timeout_s", 0.20)
         self.declare_parameter("measured_pose_timeout_s", 0.20)
-
-        self.declare_parameter("coarse_v_xy_max", 0.003)
-        self.declare_parameter("coarse_v_z_up_max", 0.003)
-        self.declare_parameter("coarse_v_z_down_max", 0.001)
-        self.declare_parameter("coarse_a_xy_max", 0.010)
-        self.declare_parameter("coarse_a_z_up_max", 0.010)
-        self.declare_parameter("coarse_a_z_down_max", 0.003)
-        self.declare_parameter("coarse_j_xy_max", 0.100)
-        self.declare_parameter("coarse_j_z_up_max", 0.100)
-        self.declare_parameter("coarse_j_z_down_max", 0.030)
-
-        self.declare_parameter("fine_v_xy_max", 0.001)
-        self.declare_parameter("fine_v_z_up_max", 0.001)
-        self.declare_parameter("fine_v_z_down_max", 0.0005)
-        self.declare_parameter("fine_a_xy_max", 0.004)
-        self.declare_parameter("fine_a_z_up_max", 0.004)
-        self.declare_parameter("fine_a_z_down_max", 0.0015)
-        self.declare_parameter("fine_j_xy_max", 0.040)
-        self.declare_parameter("fine_j_z_up_max", 0.040)
-        self.declare_parameter("fine_j_z_down_max", 0.015)
-
-        self.declare_parameter("d_move", 3.0)
-        self.declare_parameter("d_stop", 5.0)
-        self.declare_parameter("dt_nominal", 0.004)
-        self.declare_parameter("dt_max", 0.020)
-        self.declare_parameter("delta_xy_max", 0.000020)
-        self.declare_parameter("delta_z_up_max", 0.000020)
-        self.declare_parameter("delta_z_down_max", 0.000010)
-        self.declare_parameter("workspace_slowdown_distance", 0.030)
-        self.declare_parameter("workspace_low", [0.25, -0.20, 0.04])
-        self.declare_parameter("workspace_high", [0.75, 0.25, 0.75])
 
         self.action_topic = self.get_parameter("action_topic").value
         self.deadman_topic = self.get_parameter("deadman_topic").value
@@ -162,11 +123,15 @@ class ImpedanceTeleopServer(Node):
         self.rate_hz = float(self.get_parameter("rate_hz").value)
         self.log_rate_hz = float(self.get_parameter("log_rate_hz").value)
         self.debug_csv_path = str(self.get_parameter("debug_csv_path").value)
+        self.direct_target_mode = bool(self.get_parameter("direct_target_mode").value)
+        self.direct_target_normal_speed = float(
+            self.get_parameter("direct_target_normal_speed").value
+        )
+        self.direct_target_fine_speed = float(self.get_parameter("direct_target_fine_speed").value)
         self.command_timeout_s = float(self.get_parameter("command_timeout_s").value)
         self.measured_pose_timeout_s = float(self.get_parameter("measured_pose_timeout_s").value)
-        self.workspace_low = get_array(self, "workspace_low")
-        self.workspace_high = get_array(self, "workspace_high")
-        self.motion_shaper = self._make_motion_shaper()
+        self.workspace_low, self.workspace_high = get_workspace_bounds(self)
+        self.motion_shaper = build_motion_shaper(self)
 
         self.action = np.zeros(3, dtype=np.float64)
         self.rotation_action = np.zeros(3, dtype=np.float64)
@@ -183,6 +148,8 @@ class ImpedanceTeleopServer(Node):
         self.controller_state = "unchecked"
         self.last_controller_check_time = 0.0
         self.pending_controller_future = None
+        self.pending_controller_request_time = 0.0
+        self.controller_request_timeout_s = 2.0
         self.external_wrench: WrenchStamped | None = None
         self.debug_file = None
         self.debug_writer = None
@@ -218,55 +185,11 @@ class ImpedanceTeleopServer(Node):
             self.debug_file.close()
         return super().destroy_node()
 
-    def _make_motion_shaper(self) -> MotionShaper:
-        def limits(prefix: str) -> AxisMotionLimits:
-            return AxisMotionLimits(
-                v_xy=float(self.get_parameter(f"{prefix}_v_xy_max").value),
-                v_z_up=float(self.get_parameter(f"{prefix}_v_z_up_max").value),
-                v_z_down=float(self.get_parameter(f"{prefix}_v_z_down_max").value),
-                a_xy=float(self.get_parameter(f"{prefix}_a_xy_max").value),
-                a_z_up=float(self.get_parameter(f"{prefix}_a_z_up_max").value),
-                a_z_down=float(self.get_parameter(f"{prefix}_a_z_down_max").value),
-                j_xy=float(self.get_parameter(f"{prefix}_j_xy_max").value),
-                j_z_up=float(self.get_parameter(f"{prefix}_j_z_up_max").value),
-                j_z_down=float(self.get_parameter(f"{prefix}_j_z_down_max").value),
-            )
-
-        return MotionShaper(
-            MotionShapingConfig(
-                speed_scale=self._effective_speed_scale(False),
-                translation_deadzone=float(self.get_parameter("translation_deadzone").value),
-                rotation_deadzone=float(self.get_parameter("rotation_deadzone").value),
-                input_power=float(self.get_parameter("input_power").value),
-                max_action_norm=float(self.get_parameter("max_action_norm").value),
-                coarse_limits=limits("coarse"),
-                fine_limits=limits("fine"),
-                d_move=float(self.get_parameter("d_move").value),
-                d_stop=float(self.get_parameter("d_stop").value),
-                dt_nominal=float(self.get_parameter("dt_nominal").value),
-                dt_max=float(self.get_parameter("dt_max").value),
-                delta_limits=StepDeltaLimits(
-                    xy=float(self.get_parameter("delta_xy_max").value),
-                    z_up=float(self.get_parameter("delta_z_up_max").value),
-                    z_down=float(self.get_parameter("delta_z_down_max").value),
-                ),
-                workspace_slowdown_distance=float(
-                    self.get_parameter("workspace_slowdown_distance").value
-                ),
-            )
-        )
-
     def _effective_speed_scale(self, fine_mode: bool) -> float:
-        speed_scale = float(self.get_parameter("speed_scale").value)
-        global_scale = float(self.get_parameter("spacemouse_target_scale").value)
-        mode_scale_name = (
-            "fine_spacemouse_target_scale" if fine_mode else "normal_spacemouse_target_scale"
-        )
-        mode_scale = float(self.get_parameter(mode_scale_name).value)
-        return max(0.0, speed_scale * global_scale * mode_scale)
+        return effective_target_generation_scale(self, fine_mode)
 
     def _refresh_runtime_motion_scale(self) -> None:
-        self.motion_shaper.config.speed_scale = self._effective_speed_scale(self.fine_mode)
+        refresh_motion_shaper_scale(self, self.motion_shaper, self.fine_mode)
 
     def _action_cb(self, msg: TwistStamped) -> None:
         self.action = np.array([msg.twist.linear.x, msg.twist.linear.y, msg.twist.linear.z])
@@ -297,6 +220,11 @@ class ImpedanceTeleopServer(Node):
         dt = max(1e-4, min(0.05, now - self.last_tick_time))
         self.last_tick_time = now
         self.publish_enabled = bool(self.get_parameter("publish_enabled").value)
+        self.direct_target_mode = bool(self.get_parameter("direct_target_mode").value)
+        self.direct_target_normal_speed = float(
+            self.get_parameter("direct_target_normal_speed").value
+        )
+        self.direct_target_fine_speed = float(self.get_parameter("direct_target_fine_speed").value)
         self._refresh_runtime_motion_scale()
         self._update_controller_status(now)
 
@@ -326,29 +254,38 @@ class ImpedanceTeleopServer(Node):
             return
 
         if self.deadman and action_fresh:
-            result = self.motion_shaper.step(
-                self.action,
-                True,
-                self.fine_mode,
-                dt,
-                self.target_pose[:3],
-                self.workspace_low,
-                self.workspace_high,
-            )
-            self.target_pose[:3] += result.delta_position
+            if self.direct_target_mode:
+                speed = (
+                    self.direct_target_fine_speed
+                    if self.fine_mode
+                    else self.direct_target_normal_speed
+                )
+                self.target_pose[:3] += self.action * max(0.0, speed) * dt
+            else:
+                result = self.motion_shaper.step(
+                    self.action,
+                    True,
+                    self.fine_mode,
+                    dt,
+                    self.target_pose[:3],
+                    self.workspace_low,
+                    self.workspace_high,
+                )
+                self.target_pose[:3] += result.delta_position
             if self.measured_pose is not None:
                 self.target_pose[3:7] = self.measured_pose[3:7]
             state = "HUMAN_CONTROL"
         else:
-            self.motion_shaper.step(
-                np.zeros(3),
-                False,
-                self.fine_mode,
-                dt,
-                self.target_pose[:3],
-                self.workspace_low,
-                self.workspace_high,
-            )
+            if not self.direct_target_mode:
+                self.motion_shaper.step(
+                    np.zeros(3),
+                    False,
+                    self.fine_mode,
+                    dt,
+                    self.target_pose[:3],
+                    self.workspace_low,
+                    self.workspace_high,
+                )
 
         if self.publish_enabled:
             self.target_pub.publish(array_to_pose_msg(self.target_pose, self.frame_id, self))
@@ -368,6 +305,15 @@ class ImpedanceTeleopServer(Node):
             self.controller_state = "not required"
             return
         if self.pending_controller_future is not None:
+            if now - self.pending_controller_request_time > self.controller_request_timeout_s:
+                self.pending_controller_future.cancel()
+                self.pending_controller_future = None
+                self.pending_controller_request_time = 0.0
+                self.controller_active = False
+                self.controller_state = "list_controllers timeout"
+            else:
+                return
+        if self.pending_controller_future is not None:
             return
         if now - self.last_controller_check_time < 1.0:
             return
@@ -377,6 +323,7 @@ class ImpedanceTeleopServer(Node):
             self.controller_state = "controller_manager unavailable"
             return
         self.pending_controller_future = self.controller_client.call_async(ListControllers.Request())
+        self.pending_controller_request_time = now
         self.pending_controller_future.add_done_callback(self._controller_status_cb)
 
     def _controller_status_cb(self, future) -> None:
@@ -386,6 +333,7 @@ class ImpedanceTeleopServer(Node):
             self.controller_active = False
             self.controller_state = f"list_controllers failed: {exc}"
             self.pending_controller_future = None
+            self.pending_controller_request_time = 0.0
             return
         self.controller_active = False
         self.controller_state = "not loaded"
@@ -395,6 +343,7 @@ class ImpedanceTeleopServer(Node):
                 self.controller_active = controller.state == "active"
                 break
         self.pending_controller_future = None
+        self.pending_controller_request_time = 0.0
 
     def _status_fields(self, now: float, state: str, reason: str) -> dict[str, object]:
         force_norm, torque_norm = wrench_norm(self.external_wrench)
@@ -422,6 +371,9 @@ class ImpedanceTeleopServer(Node):
                 self.get_parameter("fine_spacemouse_target_scale").value
             ),
             "effective_speed_scale": self.motion_shaper.config.speed_scale,
+            "direct_target_mode": self.direct_target_mode,
+            "direct_target_normal_speed": self.direct_target_normal_speed,
+            "direct_target_fine_speed": self.direct_target_fine_speed,
             "deadman": self.deadman,
             "fine_mode": self.fine_mode,
             "measured_pose_fresh": now - self.last_measured_time <= self.measured_pose_timeout_s,
@@ -468,6 +420,9 @@ class ImpedanceTeleopServer(Node):
                 "normal_spacemouse_target_scale",
                 "fine_spacemouse_target_scale",
                 "effective_speed_scale",
+                "direct_target_mode",
+                "direct_target_normal_speed",
+                "direct_target_fine_speed",
                 "target_publish_count",
                 "target_x",
                 "target_y",

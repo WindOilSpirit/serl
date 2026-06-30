@@ -92,6 +92,11 @@ class SerlCartesianImpedanceController : public controller_interface::Controller
   bool enable_nullspace_torque_{false};
   double translational_stiffness_{600.0};
   std::atomic<double> runtime_translational_stiffness_{600.0};
+  std::atomic<double> runtime_translational_stiffness_x_{-1.0};
+  std::atomic<double> runtime_translational_stiffness_y_{-1.0};
+  std::atomic<double> runtime_translational_stiffness_z_{-1.0};
+  std::atomic<double> runtime_z_gravity_compensation_force_{0.0};
+  std::atomic<double> runtime_positive_x_compensation_force_{0.0};
   double rotational_stiffness_{40.0};
   double translational_damping_{40.0};
   double rotational_damping_{8.0};
@@ -127,12 +132,21 @@ class SerlCartesianImpedanceController : public controller_interface::Controller
   Vector7d debug_coriolis_{Vector7d::Zero()};
   Vector7d debug_tau_before_saturation_{Vector7d::Zero()};
   Vector7d debug_tau_after_saturation_{Vector7d::Zero()};
+  Vector7d debug_tau_j_{Vector7d::Zero()};
+  Vector7d debug_tau_j_d_{Vector7d::Zero()};
+  Vector7d debug_tau_ext_hat_filtered_{Vector7d::Zero()};
   Eigen::Matrix<double, 6, 1> debug_wrench_est_{Eigen::Matrix<double, 6, 1>::Zero()};
   Eigen::Matrix<double, 6, 1> debug_wrench_est_error_{Eigen::Matrix<double, 6, 1>::Zero()};
+  Eigen::Matrix<double, 6, 1> debug_o_f_ext_hat_k_{Eigen::Matrix<double, 6, 1>::Zero()};
+  Eigen::Matrix<double, 6, 1> debug_k_f_ext_hat_k_{Eigen::Matrix<double, 6, 1>::Zero()};
   std::array<double, 16> debug_o_t_ee_{};
   std::array<double, 42> debug_zero_jacobian_{};
   Eigen::Vector3d previous_measured_position_{Eigen::Vector3d::Zero()};
   bool previous_measured_position_initialized_{false};
+  double previous_raw_target_x_{std::numeric_limits<double>::quiet_NaN()};
+  bool previous_raw_target_x_initialized_{false};
+  double previous_raw_target_z_{std::numeric_limits<double>::quiet_NaN()};
+  bool previous_raw_target_z_initialized_{false};
   std::array<size_t, 7> q_state_interface_indices_{};
   std::array<size_t, 7> dq_state_interface_indices_{};
   bool state_interface_indices_initialized_{false};
@@ -151,6 +165,8 @@ class SerlCartesianImpedanceController : public controller_interface::Controller
   double debug_velocity_diff_norm_{std::numeric_limits<double>::quiet_NaN()};
   double debug_tau_task_nullspace_dot_{std::numeric_limits<double>::quiet_NaN()};
   double debug_wrench_est_error_norm_{std::numeric_limits<double>::quiet_NaN()};
+  bool debug_positive_x_compensation_active_{false};
+  bool debug_z_gravity_compensation_active_{false};
 };
 
 }  // namespace serl_franka_ros2_control

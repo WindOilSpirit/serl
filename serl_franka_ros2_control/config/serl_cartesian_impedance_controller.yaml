@@ -15,7 +15,12 @@
       enable_nullspace_torque: false
       reference_limit_mode: "per_axis_error_clip"
 
-      translational_stiffness: 600.0
+      translational_stiffness: 5000.0
+      translational_stiffness_x: -1.0
+      translational_stiffness_y: -1.0
+      translational_stiffness_z: -1.0
+      z_gravity_compensation_force: 0.0
+      positive_x_compensation_force: 0.0
       rotational_stiffness: 40.0
       translational_damping: 40.0
       rotational_damping: 8.0

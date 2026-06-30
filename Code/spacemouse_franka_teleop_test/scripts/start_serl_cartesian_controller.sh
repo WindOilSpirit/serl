@@ -24,6 +24,32 @@ BRINGUP_LOG="${LOG_DIR}/franka_bringup_from_controller_button.log"
 
 bringup_pid=""
 started_bringup=0
+controller_manager_ready() {
+  timeout 2 ros2 control list_controllers -c "${CONTROLLER_MANAGER}" >/dev/null 2>&1
+}
+
+stop_stale_bringup() {
+  echo "清理不可用的 Franka bringup/controller_manager 残留进程。"
+  pkill -INT -f "[r]os2 launch franka_bringup" || true
+  pkill -INT -f "[f]ranka.launch.py" || true
+  pkill -INT -f "[r]os2_control_node" || true
+  sleep 2
+  pkill -TERM -f "[r]os2 launch franka_bringup" || true
+  pkill -TERM -f "[f]ranka.launch.py" || true
+  pkill -TERM -f "[r]os2_control_node" || true
+  sleep 1
+}
+
+start_bringup() {
+  echo "启动 Franka bringup，日志: ${BRINGUP_LOG}"
+  ros2 launch franka_bringup franka.launch.py \
+    arm_id:="${ARM_ID}" \
+    robot_ip:="${ROBOT_IP}" \
+    >"${BRINGUP_LOG}" 2>&1 &
+  bringup_pid="$!"
+  started_bringup=1
+}
+
 cleanup() {
   if [ -n "${bringup_pid}" ] && kill -0 "${bringup_pid}" 2>/dev/null; then
     kill -INT "${bringup_pid}" 2>/dev/null || true
@@ -33,21 +59,22 @@ cleanup() {
 trap cleanup INT TERM EXIT
 
 if pgrep -af "[r]os2_control_node|[f]ranka.launch.py" >/dev/null; then
-  echo "检测到已有 Franka bringup/controller_manager 相关进程，跳过重复启动。"
+  echo "检测到已有 Franka bringup/controller_manager 相关进程，检查 controller_manager 可用性。"
+  if controller_manager_ready; then
+    echo "已有 controller_manager 可用，跳过重复启动。"
+  else
+    echo "已有进程但 controller_manager 不可用，将重启 Franka bringup。"
+    stop_stale_bringup
+    start_bringup
+  fi
 else
-  echo "启动 Franka bringup，日志: ${BRINGUP_LOG}"
-  ros2 launch franka_bringup franka.launch.py \
-    arm_id:="${ARM_ID}" \
-    robot_ip:="${ROBOT_IP}" \
-    >"${BRINGUP_LOG}" 2>&1 &
-  bringup_pid="$!"
-  started_bringup=1
+  start_bringup
 fi
 
 echo "等待 controller_manager 可用: ${CONTROLLER_MANAGER}"
 manager_ready=0
 for _ in $(seq 1 30); do
-  if timeout 2 ros2 control list_controllers -c "${CONTROLLER_MANAGER}" >/dev/null 2>&1; then
+  if controller_manager_ready; then
     manager_ready=1
     break
   fi

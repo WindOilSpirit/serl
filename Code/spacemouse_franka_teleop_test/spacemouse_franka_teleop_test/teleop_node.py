@@ -19,6 +19,7 @@ from std_msgs.msg import Bool
 @dataclass
 class SpaceMouseSample:
     action: np.ndarray
+    raw_action: np.ndarray
     buttons: list[int]
     timestamp: float
 
@@ -32,11 +33,13 @@ class SpaceMouseReader:
                 raise RuntimeError("pyspacemouse import failed") from exc
             self._device = None
             self._lock = threading.Lock()
-            self._sample = SpaceMouseSample(np.zeros(6, dtype=np.float64), [0, 0], time.time())
+            zero = np.zeros(6, dtype=np.float64)
+            self._sample = SpaceMouseSample(zero.copy(), zero.copy(), [0, 0], time.time())
             self._stop = threading.Event()
             return
         self._lock = threading.Lock()
-        self._sample = SpaceMouseSample(np.zeros(6, dtype=np.float64), [0, 0], time.time())
+        zero = np.zeros(6, dtype=np.float64)
+        self._sample = SpaceMouseSample(zero.copy(), zero.copy(), [0, 0], time.time())
         self._stop = threading.Event()
         self._device = None
         try:
@@ -61,6 +64,7 @@ class SpaceMouseReader:
         with self._lock:
             return SpaceMouseSample(
                 self._sample.action.copy(),
+                self._sample.raw_action.copy(),
                 list(self._sample.buttons),
                 self._sample.timestamp,
             )
@@ -73,12 +77,12 @@ class SpaceMouseReader:
             if state is None:
                 time.sleep(0.002)
                 continue
-            action = np.array(
-                [-state.y, state.x, state.z, -state.roll, -state.pitch, -state.yaw],
+            raw_action = np.array(
+                [state.x, state.y, state.z, state.roll, state.pitch, state.yaw],
                 dtype=np.float64,
             )
             with self._lock:
-                self._sample = SpaceMouseSample(action, list(state.buttons), time.time())
+                self._sample = SpaceMouseSample(raw_action.copy(), raw_action, list(state.buttons), time.time())
 
 
 def get_double_array(node: Node, name: str) -> np.ndarray:
@@ -105,9 +109,9 @@ class SpaceMouseFrankaTeleopNode(Node):
         self.declare_parameter("retreat_button_index", -1)
         self.declare_parameter("command_start_hold_s", 0.4)
         self.declare_parameter("debug_force_deadman_after_sec", 0.0)
-        self.declare_parameter("debug_z_input_after_deadman_sec", 4.0)
+        self.declare_parameter("debug_z_input_after_deadman_sec", 0.0)
         self.declare_parameter("debug_z_input_value", 0.15)
-        self.declare_parameter("debug_z_input_duration_sec", 2.0)
+        self.declare_parameter("debug_z_input_duration_sec", 0.0)
         self.declare_parameter("debug_z_input_ramp_s", 0.4)
         self.declare_parameter("debug_z_oscillation_mode", False)
         self.declare_parameter("debug_z_cycle_period_s", 6.0)
@@ -115,6 +119,7 @@ class SpaceMouseFrankaTeleopNode(Node):
         self.declare_parameter("debug_z_cycle_value", 0.15)
 
         self.declare_parameter("axis_sign", [1.0, 1.0, 1.0])
+        self.declare_parameter("spacemouse_axis_map", [-2, 1, 3, -4, -5, -6])
 
         self.target_topic = self.get_parameter("target_topic").value
         self.deadman_topic = self.get_parameter("deadman_topic").value
@@ -147,6 +152,7 @@ class SpaceMouseFrankaTeleopNode(Node):
         self.debug_z_cycle_delay_s = max(0.0, float(self.get_parameter("debug_z_cycle_delay_s").value))
         self.debug_z_cycle_value = float(self.get_parameter("debug_z_cycle_value").value)
         self.axis_sign = get_double_array(self, "axis_sign")
+        self.spacemouse_axis_map = self._read_axis_map()
 
         self.last_action = np.zeros(3, dtype=np.float64)
         self.control_start_time: float | None = None
@@ -190,6 +196,7 @@ class SpaceMouseFrankaTeleopNode(Node):
         now = time.time()
         dt = max(1e-3, min(0.2, now - self.last_timer_time))
         self.last_timer_time = now
+        self._refresh_runtime_params()
         self._update_controller_status(now)
 
         sample = self.spacemouse.latest()
@@ -208,19 +215,20 @@ class SpaceMouseFrankaTeleopNode(Node):
         self.previous_deadman = deadman
         self._publish_input_flags(deadman, retreat, fine)
 
-        action = self._effective_translation_input(sample, deadman, now)
+        mapped_action = self._mapped_spacemouse_action(sample)
+        action = self._effective_translation_input(mapped_action[:3], deadman, now)
         self.last_action[:] = action
 
-        self._publish_target(action, sample.action[3:6])
+        self._publish_target(action, mapped_action[3:6])
         note = "input facts"
         if not self.debug_simulation_mode and self.require_active_controller and not self.controller_active:
             note = f"{note}; controller not active ({self.controller_state})"
         if not self.debug_simulation_mode and self.target_pub.get_subscription_count() == 0:
             note = f"{note}; no action server subscription"
-        self._log_throttled(now, sample, deadman, fine, action, action, note)
+        self._log_throttled(now, sample, deadman, fine, mapped_action, action, note)
 
-    def _effective_translation_input(self, sample: SpaceMouseSample, deadman: bool, now: float) -> np.ndarray:
-        raw_translation = sample.action[:3].copy()
+    def _effective_translation_input(self, mapped_translation: np.ndarray, deadman: bool, now: float) -> np.ndarray:
+        raw_translation = mapped_translation.copy()
         if (
             deadman
             and self.control_start_time is not None
@@ -244,6 +252,49 @@ class SpaceMouseFrankaTeleopNode(Node):
                         envelope = 1.0
                     raw_translation[2] = float(np.clip(self.debug_z_input_value, -1.0, 1.0)) * envelope
         return raw_translation * self.axis_sign
+
+    def _refresh_runtime_params(self) -> None:
+        self.debug_force_deadman_after_sec = float(
+            self.get_parameter("debug_force_deadman_after_sec").value
+        )
+        self.debug_z_input_after_deadman_sec = float(
+            self.get_parameter("debug_z_input_after_deadman_sec").value
+        )
+        self.debug_z_input_value = float(self.get_parameter("debug_z_input_value").value)
+        self.debug_z_input_duration_sec = float(
+            self.get_parameter("debug_z_input_duration_sec").value
+        )
+        self.debug_z_input_ramp_s = max(0.0, float(self.get_parameter("debug_z_input_ramp_s").value))
+        self.debug_z_oscillation_mode = bool(self.get_parameter("debug_z_oscillation_mode").value)
+        self.debug_z_cycle_period_s = max(
+            1e-3, float(self.get_parameter("debug_z_cycle_period_s").value)
+        )
+        self.debug_z_cycle_delay_s = max(
+            0.0, float(self.get_parameter("debug_z_cycle_delay_s").value)
+        )
+        self.debug_z_cycle_value = float(self.get_parameter("debug_z_cycle_value").value)
+        self.axis_sign = get_double_array(self, "axis_sign")
+        self.spacemouse_axis_map = self._read_axis_map()
+
+    def _read_axis_map(self) -> np.ndarray:
+        try:
+            axis_map = np.asarray(self.get_parameter("spacemouse_axis_map").value, dtype=np.int64)
+        except Exception:
+            axis_map = np.array([-2, 1, 3, -4, -5, -6], dtype=np.int64)
+        if axis_map.shape != (6,) or np.any(np.abs(axis_map) < 1) or np.any(np.abs(axis_map) > 6):
+            self.get_logger().warn(
+                "Invalid spacemouse_axis_map; using default [-2, 1, 3, -4, -5, -6]."
+            )
+            return np.array([-2, 1, 3, -4, -5, -6], dtype=np.int64)
+        return axis_map
+
+    def _mapped_spacemouse_action(self, sample: SpaceMouseSample) -> np.ndarray:
+        mapped = np.zeros(6, dtype=np.float64)
+        for output_index, signed_input_index in enumerate(self.spacemouse_axis_map):
+            input_index = abs(int(signed_input_index)) - 1
+            sign = 1.0 if signed_input_index > 0 else -1.0
+            mapped[output_index] = sign * sample.raw_action[input_index]
+        return mapped
 
     def _update_controller_status(self, now: float) -> None:
         if not self.require_active_controller:
@@ -325,12 +376,13 @@ class SpaceMouseFrankaTeleopNode(Node):
         self.last_log_time = now
         mode = "fine" if fine else "coarse"
         self.get_logger().info(
-            "state=%s deadman=%s mode=%s raw=%s action=%s last_action=%s note=%s"
+                "state=%s deadman=%s mode=%s raw_device=%s mapped=%s action=%s last_action=%s note=%s"
             % (
                 "DEADMAN" if deadman else "IDLE",
                 deadman,
                 mode,
-                np.array2string(sample.action[:3], precision=3, suppress_small=True),
+                np.array2string(sample.raw_action[:3], precision=3, suppress_small=True),
+                np.array2string(command_delta[:3], precision=3, suppress_small=True),
                 np.array2string(command_delta, precision=5, suppress_small=True),
                 np.array2string(self.last_action, precision=5, suppress_small=True),
                 reason,

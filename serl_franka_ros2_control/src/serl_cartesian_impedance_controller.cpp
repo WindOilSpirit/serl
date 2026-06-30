@@ -100,6 +100,9 @@ SerlCartesianImpedanceController::state_interface_configuration() const {
 controller_interface::return_type SerlCartesianImpedanceController::update(
     const rclcpp::Time& time, const rclcpp::Duration& period) {
   update_period_s_ = period.seconds();
+  const double dt = std::isfinite(update_period_s_) && update_period_s_ > 0.0
+                        ? update_period_s_
+                        : 0.001;
 
   franka::RobotState* robot_state = get_robot_state_ptr();
   if (robot_state == nullptr) {
@@ -108,89 +111,79 @@ controller_interface::return_type SerlCartesianImpedanceController::update(
   }
 
   try {
-    if (use_robot_state_q_dq_) {
-      update_joint_state_from_robot_state(*robot_state);
-    } else {
-      update_joint_state_from_interfaces();
-    }
+    update_joint_state_from_robot_state(*robot_state);
     if (!read_measured_pose(measured_pose_)) {
       RCLCPP_FATAL(get_node()->get_logger(), "Measured Franka end-effector pose is invalid.");
       return controller_interface::return_type::ERROR;
     }
 
-    PoseReference raw_target_snapshot;
+    PoseReference target;
     rclcpp::Time last_target_snapshot;
     bool has_target_snapshot = false;
     {
-      std::unique_lock<std::mutex> lock(target_mutex_, std::try_to_lock);
-      if (lock.owns_lock()) {
-        raw_target_snapshot = raw_target_;
-        last_target_snapshot = last_target_time_;
-        has_target_snapshot = target_received_;
-      }
+      std::lock_guard<std::mutex> lock(target_mutex_);
+      target = raw_target_;
+      last_target_snapshot = last_target_time_;
+      has_target_snapshot = target_received_;
     }
-
-    const bool target_fresh =
-        has_target_snapshot && last_target_snapshot.nanoseconds() > 0 &&
-        (watchdog_timeout_sec_ <= 0.0 ||
-         (time - last_target_snapshot).seconds() <= watchdog_timeout_sec_);
     target_age_s_ =
-        has_target_snapshot ? (time - last_target_snapshot).seconds()
-                            : std::numeric_limits<double>::quiet_NaN();
+        has_target_snapshot && last_target_snapshot.nanoseconds() > 0
+            ? (time - last_target_snapshot).seconds()
+            : std::numeric_limits<double>::quiet_NaN();
 
-    if (target_fresh) {
-      if (!smoothed_target_initialized_) {
-        smoothed_target_ = measured_pose_;
-        smoothed_target_initialized_ = true;
-      }
-      Eigen::Quaterniond raw_orientation = raw_target_snapshot.orientation;
-      if (smoothed_target_.orientation.coeffs().dot(raw_orientation.coeffs()) < 0.0) {
-        raw_orientation.coeffs() *= -1.0;
-      }
-      smoothed_target_.position =
-          filter_coeff_ * raw_target_snapshot.position +
-          (1.0 - filter_coeff_) * smoothed_target_.position;
-      smoothed_target_.orientation =
-          smoothed_target_.orientation.slerp(filter_coeff_, raw_orientation).normalized();
-      limited_reference_ = limit_reference(smoothed_target_, measured_pose_);
-    } else if (!smoothed_target_initialized_) {
+    if (!smoothed_target_initialized_) {
       smoothed_target_ = measured_pose_;
-      limited_reference_ = measured_pose_;
       smoothed_target_initialized_ = true;
-      reference_was_clipped_ = false;
-      position_error_before_clip_ = 0.0;
-      position_error_after_clip_ = 0.0;
-      orientation_error_before_clip_ = 0.0;
-      orientation_error_after_clip_ = 0.0;
-    } else {
-      reference_was_clipped_ = false;
-      position_error_before_clip_ = (limited_reference_.position - measured_pose_.position).norm();
-      position_error_after_clip_ = position_error_before_clip_;
-      orientation_error_before_clip_ =
-          quaternion_angle(measured_pose_.orientation.inverse() * limited_reference_.orientation);
-      orientation_error_after_clip_ = orientation_error_before_clip_;
     }
+    Eigen::Quaterniond target_orientation = target.orientation;
+    if (smoothed_target_.orientation.coeffs().dot(target_orientation.coeffs()) < 0.0) {
+      target_orientation.coeffs() *= -1.0;
+    }
+    smoothed_target_.position =
+        filter_coeff_ * target.position + (1.0 - filter_coeff_) * smoothed_target_.position;
+    smoothed_target_.orientation =
+        smoothed_target_.orientation.slerp(filter_coeff_, target_orientation).normalized();
+    limited_reference_ = smoothed_target_;
+    constexpr double x_command_detection_threshold = 1.0e-5;
+    bool positive_x_compensation_active = false;
+    if (previous_raw_target_x_initialized_) {
+      positive_x_compensation_active =
+          (target.position.x() - previous_raw_target_x_) > x_command_detection_threshold;
+    }
+    previous_raw_target_x_ = target.position.x();
+    previous_raw_target_x_initialized_ = true;
+
+    constexpr double z_command_detection_threshold = 1.0e-5;
+    bool z_gravity_compensation_active = false;
+    if (previous_raw_target_z_initialized_) {
+      z_gravity_compensation_active =
+          std::abs(target.position.z() - previous_raw_target_z_) > z_command_detection_threshold;
+    }
+    previous_raw_target_z_ = target.position.z();
+    previous_raw_target_z_initialized_ = true;
+
+    Eigen::Matrix<double, 6, 1> error =
+        compute_cartesian_error(measured_pose_, limited_reference_);
+    position_error_before_clip_ = error.head(3).norm();
+    position_error_after_clip_ = error.head(3).norm();
+    orientation_error_before_clip_ = error.tail(3).norm();
+    orientation_error_after_clip_ = error.tail(3).norm();
+    reference_was_clipped_ = false;
+
+    error_i_.head(3) += error.head(3) * dt;
+    error_i_.tail(3) += error.tail(3) * dt;
+    error_i_.head(3) = error_i_.head(3).cwiseMax(-0.1).cwiseMin(0.1);
+    error_i_.tail(3) = error_i_.tail(3).cwiseMax(-0.3).cwiseMin(0.3);
 
     const auto coriolis_array = franka_robot_model_->getCoriolisForceVector();
     const auto jacobian_array = franka_robot_model_->getZeroJacobian(franka::Frame::kEndEffector);
     Eigen::Map<const Vector7d> coriolis(coriolis_array.data());
     Eigen::Map<const Eigen::Matrix<double, 6, 7>> jacobian(jacobian_array.data());
-    Eigen::Map<const Vector7d> tau_j_d(robot_state->tau_J_d.data());
-
-    Eigen::Matrix<double, 6, 1> cartesian_error =
-        compute_cartesian_error(measured_pose_, limited_reference_);
-    if (reference_limit_mode_ == "per_axis_error_clip") {
-      clip_cartesian_error(cartesian_error);
-    }
-    error_i_.head(3) = (error_i_.head(3) + cartesian_error.head(3)).cwiseMax(-0.1).cwiseMin(0.1);
-    error_i_.tail(3) = (error_i_.tail(3) + cartesian_error.tail(3)).cwiseMax(-0.3).cwiseMin(0.3);
 
     const Eigen::Matrix<double, 6, 1> cartesian_velocity = jacobian * dq_;
     debug_jacobian_velocity_ = cartesian_velocity;
-    if (period.seconds() > 0.0 && std::isfinite(period.seconds()) &&
-        previous_measured_position_initialized_) {
-      debug_pose_diff_velocity_ =
-          (measured_pose_.position - previous_measured_position_) / period.seconds();
+    if (dt > 0.0 && previous_measured_position_initialized_) {
+      debug_pose_diff_velocity_ = (measured_pose_.position - previous_measured_position_) / dt;
       const Eigen::Vector3d jacobian_linear_velocity = cartesian_velocity.head(3);
       const double jacobian_norm = jacobian_linear_velocity.norm();
       const double pose_diff_norm = debug_pose_diff_velocity_.norm();
@@ -213,47 +206,106 @@ controller_interface::return_type SerlCartesianImpedanceController::update(
     previous_measured_position_ = measured_pose_.position;
     previous_measured_position_initialized_ = true;
 
-    Eigen::Matrix<double, 6, 6> cartesian_stiffness = cartesian_stiffness_;
     const double translational_stiffness =
         runtime_translational_stiffness_.load(std::memory_order_relaxed);
-    cartesian_stiffness.topLeftCorner(3, 3) =
-        translational_stiffness * Eigen::Matrix3d::Identity();
-    const Eigen::Matrix<double, 6, 1> wrench =
-        -cartesian_stiffness * cartesian_error - cartesian_damping_ * cartesian_velocity -
+    const auto axis_stiffness = [translational_stiffness](double override_value) {
+      return override_value > 0.0 ? override_value : translational_stiffness;
+    };
+    const double translational_stiffness_x =
+        axis_stiffness(runtime_translational_stiffness_x_.load(std::memory_order_relaxed));
+    const double translational_stiffness_y =
+        axis_stiffness(runtime_translational_stiffness_y_.load(std::memory_order_relaxed));
+    const double translational_stiffness_z =
+        axis_stiffness(runtime_translational_stiffness_z_.load(std::memory_order_relaxed));
+    const double translational_damping_x =
+        2.0 * std::sqrt(std::max(translational_stiffness_x, 1.0e-6));
+    const double translational_damping_y =
+        2.0 * std::sqrt(std::max(translational_stiffness_y, 1.0e-6));
+    const double translational_damping_z =
+        2.0 * std::sqrt(std::max(translational_stiffness_z, 1.0e-6));
+    const double rotational_damping =
+        2.0 * std::sqrt(std::max(rotational_stiffness_, 1.0e-6));
+
+    Eigen::Matrix<double, 6, 6> cartesian_stiffness = Eigen::Matrix<double, 6, 6>::Zero();
+    cartesian_stiffness(0, 0) = translational_stiffness_x;
+    cartesian_stiffness(1, 1) = translational_stiffness_y;
+    cartesian_stiffness(2, 2) = translational_stiffness_z;
+    cartesian_stiffness.bottomRightCorner(3, 3) =
+        rotational_stiffness_ * Eigen::Matrix3d::Identity();
+
+    Eigen::Matrix<double, 6, 6> cartesian_damping = Eigen::Matrix<double, 6, 6>::Zero();
+    cartesian_damping(0, 0) = translational_damping_x;
+    cartesian_damping(1, 1) = translational_damping_y;
+    cartesian_damping(2, 2) = translational_damping_z;
+    cartesian_damping.bottomRightCorner(3, 3) =
+        rotational_damping * Eigen::Matrix3d::Identity();
+
+    Eigen::Matrix<double, 6, 1> wrench =
+        -cartesian_stiffness * error - cartesian_damping * cartesian_velocity -
         cartesian_ki_ * error_i_;
+    if (positive_x_compensation_active) {
+      wrench(0) += runtime_positive_x_compensation_force_.load(std::memory_order_relaxed);
+    }
+    if (z_gravity_compensation_active) {
+      wrench(2) += runtime_z_gravity_compensation_force_.load(std::memory_order_relaxed);
+    }
+    constexpr double linear_wrench_norm_limit = 80.0;
+    constexpr double angular_wrench_norm_limit = 8.0;
+    const double linear_wrench_norm = wrench.head(3).norm();
+    if (linear_wrench_norm > linear_wrench_norm_limit) {
+      wrench.head(3) *= linear_wrench_norm_limit / linear_wrench_norm;
+    }
+    const double angular_wrench_norm = wrench.tail(3).norm();
+    if (angular_wrench_norm > angular_wrench_norm_limit) {
+      wrench.tail(3) *= angular_wrench_norm_limit / angular_wrench_norm;
+    }
+    // Keep the physically consistent torque mapping tau = J^T F.
+    // Do not premultiply wrench by (J J^T)^-1 here; that changes the wrench semantics.
     const Vector7d tau_task = jacobian.transpose() * wrench;
 
-    const Eigen::MatrixXd jacobian_transpose_pinv = pseudo_inverse(jacobian.transpose());
-    Vector7d qe = q_d_nullspace_ - q_;
-    Vector7d dqe = dq_;
-    qe(0) *= joint1_nullspace_stiffness_;
-    dqe(0) *= 2.0 * std::sqrt(std::max(joint1_nullspace_stiffness_, 0.0));
-    const Vector7d tau_nullspace =
-        (Eigen::Matrix<double, 7, 7>::Identity() - jacobian.transpose() * jacobian_transpose_pinv) *
-        (nullspace_stiffness_ * qe -
-         (2.0 * std::sqrt(std::max(nullspace_stiffness_, 0.0))) * dqe);
-    const Vector7d tau_nullspace_enabled =
-        enable_nullspace_torque_ ? tau_nullspace : Vector7d::Zero();
+    const Eigen::MatrixXd jacobian_pinv = pseudo_inverse(jacobian);
+    Vector7d tau_nullspace =
+        (Eigen::Matrix<double, 7, 7>::Identity() -
+         jacobian.transpose() * jacobian_pinv.transpose()) *
+        (nullspace_stiffness_ * (q_d_nullspace_ - q_) -
+         2.0 * std::sqrt(std::max(nullspace_stiffness_, 0.0)) * dq_);
+    if (!enable_nullspace_torque_) {
+      tau_nullspace.setZero();
+    }
+
     const Eigen::Matrix<double, 6, 1> wrench_est =
         pseudo_inverse(jacobian.transpose()) * tau_task;
+    const Vector7d tau_d_calculated = tau_task + tau_nullspace + coriolis;
+    const Vector7d tau_d_saturated = saturate_torque_rate(tau_d_calculated, last_tau_command_);
 
-    const Vector7d tau_d_calculated = tau_task + tau_nullspace_enabled + coriolis;
-    const Vector7d tau_d_saturated = saturate_torque_rate(tau_d_calculated, tau_j_d);
-    debug_cartesian_error_ = cartesian_error;
+    debug_cartesian_error_ = error;
     debug_wrench_ = wrench;
     debug_tau_task_ = tau_task;
     debug_tau_nullspace_ = tau_nullspace;
     debug_coriolis_ = coriolis;
     debug_tau_before_saturation_ = tau_d_calculated;
     debug_tau_after_saturation_ = tau_d_saturated;
+    debug_tau_j_ = Eigen::Map<const Vector7d>(robot_state->tau_J.data());
+    debug_tau_j_d_ = Eigen::Map<const Vector7d>(robot_state->tau_J_d.data());
+    debug_tau_ext_hat_filtered_ =
+        Eigen::Map<const Vector7d>(robot_state->tau_ext_hat_filtered.data());
+    debug_o_f_ext_hat_k_ =
+        Eigen::Map<const Eigen::Matrix<double, 6, 1>>(robot_state->O_F_ext_hat_K.data());
+    debug_k_f_ext_hat_k_ =
+        Eigen::Map<const Eigen::Matrix<double, 6, 1>>(robot_state->K_F_ext_hat_K.data());
     debug_wrench_est_ = wrench_est;
     debug_wrench_est_error_ = wrench_est - wrench;
     debug_wrench_est_error_norm_ = debug_wrench_est_error_.norm();
     debug_tau_task_nullspace_dot_ = tau_task.dot(tau_nullspace);
+    debug_positive_x_compensation_active_ = positive_x_compensation_active;
+    debug_z_gravity_compensation_active_ = z_gravity_compensation_active;
     debug_o_t_ee_ = robot_state->O_T_EE;
     debug_zero_jacobian_ = jacobian_array;
     last_tau_command_ = tau_d_saturated;
     tau_norm_ = tau_d_saturated.norm();
+    translational_damping_ =
+        (translational_damping_x + translational_damping_y + translational_damping_z) / 3.0;
+    rotational_damping_ = rotational_damping;
 
     for (size_t i = 0; i < 7; ++i) {
       command_interfaces_.at(i).set_value(tau_d_saturated(i));
@@ -277,6 +329,11 @@ CallbackReturn SerlCartesianImpedanceController::on_init() {
     auto_declare<bool>("use_robot_state_q_dq", use_robot_state_q_dq_);
     auto_declare<bool>("enable_nullspace_torque", enable_nullspace_torque_);
     auto_declare<double>("translational_stiffness", translational_stiffness_);
+    auto_declare<double>("translational_stiffness_x", -1.0);
+    auto_declare<double>("translational_stiffness_y", -1.0);
+    auto_declare<double>("translational_stiffness_z", -1.0);
+    auto_declare<double>("z_gravity_compensation_force", 0.0);
+    auto_declare<double>("positive_x_compensation_force", 0.0);
     auto_declare<double>("rotational_stiffness", rotational_stiffness_);
     auto_declare<double>("translational_damping", translational_damping_);
     auto_declare<double>("rotational_damping", rotational_damping_);
@@ -319,6 +376,21 @@ CallbackReturn SerlCartesianImpedanceController::on_configure(
   enable_nullspace_torque_ = get_node()->get_parameter("enable_nullspace_torque").as_bool();
   translational_stiffness_ = get_node()->get_parameter("translational_stiffness").as_double();
   runtime_translational_stiffness_.store(translational_stiffness_, std::memory_order_relaxed);
+  runtime_translational_stiffness_x_.store(
+      get_node()->get_parameter("translational_stiffness_x").as_double(),
+      std::memory_order_relaxed);
+  runtime_translational_stiffness_y_.store(
+      get_node()->get_parameter("translational_stiffness_y").as_double(),
+      std::memory_order_relaxed);
+  runtime_translational_stiffness_z_.store(
+      get_node()->get_parameter("translational_stiffness_z").as_double(),
+      std::memory_order_relaxed);
+  runtime_z_gravity_compensation_force_.store(
+      get_node()->get_parameter("z_gravity_compensation_force").as_double(),
+      std::memory_order_relaxed);
+  runtime_positive_x_compensation_force_.store(
+      get_node()->get_parameter("positive_x_compensation_force").as_double(),
+      std::memory_order_relaxed);
   rotational_stiffness_ = get_node()->get_parameter("rotational_stiffness").as_double();
   translational_damping_ = get_node()->get_parameter("translational_damping").as_double();
   rotational_damping_ = get_node()->get_parameter("rotational_damping").as_double();
@@ -390,35 +462,68 @@ CallbackReturn SerlCartesianImpedanceController::on_configure(
         rcl_interfaces::msg::SetParametersResult result;
         result.successful = true;
         for (const auto& parameter : parameters) {
-          if (parameter.get_name() != "translational_stiffness") {
+          const auto& name = parameter.get_name();
+          if (name != "translational_stiffness" &&
+              name != "translational_stiffness_x" &&
+              name != "translational_stiffness_y" &&
+              name != "translational_stiffness_z" &&
+              name != "z_gravity_compensation_force" &&
+              name != "positive_x_compensation_force") {
             continue;
           }
           if (parameter.get_type() != rclcpp::ParameterType::PARAMETER_DOUBLE &&
               parameter.get_type() != rclcpp::ParameterType::PARAMETER_INTEGER) {
             result.successful = false;
-            result.reason = "translational_stiffness must be numeric";
+            result.reason = name + " must be numeric";
             return result;
           }
           const double value =
               parameter.get_type() == rclcpp::ParameterType::PARAMETER_INTEGER
                   ? static_cast<double>(parameter.as_int())
                   : parameter.as_double();
-          if (!std::isfinite(value) || value < 0.0 || value > 5000.0) {
+          const bool is_force_compensation =
+              name == "z_gravity_compensation_force" ||
+              name == "positive_x_compensation_force";
+          const double lower = is_force_compensation
+                                   ? -50.0
+                                   : (name == "translational_stiffness" ? 0.0 : -1.0);
+          const double upper = is_force_compensation
+                                   ? 50.0
+                                   : (name == "translational_stiffness" ? 5000.0 : 10000.0);
+          if (!std::isfinite(value) || value < lower || value > upper) {
             result.successful = false;
-            result.reason = "translational_stiffness must be finite and in [0, 5000]";
+            result.reason = name + " must be finite and in [" + std::to_string(lower) + ", " +
+                            std::to_string(upper) + "]";
             return result;
           }
         }
         for (const auto& parameter : parameters) {
-          if (parameter.get_name() == "translational_stiffness") {
-            const double value =
-                parameter.get_type() == rclcpp::ParameterType::PARAMETER_INTEGER
-                    ? static_cast<double>(parameter.as_int())
-                    : parameter.as_double();
-            runtime_translational_stiffness_.store(value, std::memory_order_relaxed);
-            translational_stiffness_ = value;
-            RCLCPP_INFO(get_node()->get_logger(),
-                        "Runtime translational_stiffness updated to %.3f N/m", value);
+          const auto& name = parameter.get_name();
+          if (name == "translational_stiffness" ||
+              name == "translational_stiffness_x" ||
+              name == "translational_stiffness_y" ||
+              name == "translational_stiffness_z" ||
+              name == "z_gravity_compensation_force" ||
+              name == "positive_x_compensation_force") {
+            const double value = parameter.get_type() == rclcpp::ParameterType::PARAMETER_INTEGER
+                                     ? static_cast<double>(parameter.as_int())
+                                     : parameter.as_double();
+            if (name == "translational_stiffness") {
+              translational_stiffness_ = value;
+              runtime_translational_stiffness_.store(value, std::memory_order_relaxed);
+            } else if (name == "translational_stiffness_x") {
+              runtime_translational_stiffness_x_.store(value, std::memory_order_relaxed);
+            } else if (name == "translational_stiffness_y") {
+              runtime_translational_stiffness_y_.store(value, std::memory_order_relaxed);
+            } else if (name == "translational_stiffness_z") {
+              runtime_translational_stiffness_z_.store(value, std::memory_order_relaxed);
+            } else if (name == "z_gravity_compensation_force") {
+              runtime_z_gravity_compensation_force_.store(value, std::memory_order_relaxed);
+            } else if (name == "positive_x_compensation_force") {
+              runtime_positive_x_compensation_force_.store(value, std::memory_order_relaxed);
+            }
+            RCLCPP_INFO(get_node()->get_logger(), "Runtime %s updated to %.3f",
+                        name.c_str(), value);
           }
         }
         return result;
@@ -492,6 +597,10 @@ CallbackReturn SerlCartesianImpedanceController::on_activate(
   smoothed_target_ = measured_pose_;
   limited_reference_ = measured_pose_;
   smoothed_target_initialized_ = true;
+  previous_raw_target_x_ = raw_target_.position.x();
+  previous_raw_target_x_initialized_ = true;
+  previous_raw_target_z_ = raw_target_.position.z();
+  previous_raw_target_z_initialized_ = true;
   error_i_.setZero();
   last_tau_command_.setZero();
   debug_cartesian_error_.setZero();
@@ -503,6 +612,11 @@ CallbackReturn SerlCartesianImpedanceController::on_activate(
   debug_coriolis_.setZero();
   debug_tau_before_saturation_.setZero();
   debug_tau_after_saturation_.setZero();
+  debug_tau_j_.setZero();
+  debug_tau_j_d_.setZero();
+  debug_tau_ext_hat_filtered_.setZero();
+  debug_o_f_ext_hat_k_.setZero();
+  debug_k_f_ext_hat_k_.setZero();
   debug_wrench_est_.setZero();
   debug_wrench_est_error_.setZero();
   debug_o_t_ee_.fill(0.0);
@@ -514,6 +628,8 @@ CallbackReturn SerlCartesianImpedanceController::on_activate(
   debug_velocity_diff_norm_ = quiet_nan();
   debug_tau_task_nullspace_dot_ = quiet_nan();
   debug_wrench_est_error_norm_ = quiet_nan();
+  debug_positive_x_compensation_active_ = false;
+  debug_z_gravity_compensation_active_ = false;
   active_ = true;
   target_received_ = false;
   target_update_count_ = 0;
@@ -533,6 +649,10 @@ CallbackReturn SerlCartesianImpedanceController::on_deactivate(
   }
   state_interface_indices_initialized_ = false;
   previous_measured_position_initialized_ = false;
+  previous_raw_target_x_initialized_ = false;
+  previous_raw_target_z_initialized_ = false;
+  debug_positive_x_compensation_active_ = false;
+  debug_z_gravity_compensation_active_ = false;
   for (auto& command_interface : command_interfaces_) {
     command_interface.set_value(0.0);
   }
@@ -814,6 +934,7 @@ void SerlCartesianImpedanceController::publish_status(const rclcpp::Time& time) 
       << " target_distance_clamped=0"
       << " use_robot_state_q_dq=" << static_cast<int>(use_robot_state_q_dq_)
       << " enable_nullspace_torque=" << static_cast<int>(enable_nullspace_torque_)
+      << " control_law_mode=raw_target_no_filter_no_cartesian_clip"
       << " reference_limit_mode=" << reference_limit_mode_
       << " desired_speed_limited=0"
       << " desired_acceleration_limited=0"
@@ -847,6 +968,26 @@ void SerlCartesianImpedanceController::publish_status(const rclcpp::Time& time) 
       << " update_period_s=" << update_period_s_
       << " translational_stiffness="
       << runtime_translational_stiffness_.load(std::memory_order_relaxed)
+      << " translational_stiffness_x="
+      << (runtime_translational_stiffness_x_.load(std::memory_order_relaxed) > 0.0
+              ? runtime_translational_stiffness_x_.load(std::memory_order_relaxed)
+              : runtime_translational_stiffness_.load(std::memory_order_relaxed))
+      << " translational_stiffness_y="
+      << (runtime_translational_stiffness_y_.load(std::memory_order_relaxed) > 0.0
+              ? runtime_translational_stiffness_y_.load(std::memory_order_relaxed)
+              : runtime_translational_stiffness_.load(std::memory_order_relaxed))
+      << " translational_stiffness_z="
+      << (runtime_translational_stiffness_z_.load(std::memory_order_relaxed) > 0.0
+              ? runtime_translational_stiffness_z_.load(std::memory_order_relaxed)
+              : runtime_translational_stiffness_.load(std::memory_order_relaxed))
+      << " z_gravity_compensation_force="
+      << runtime_z_gravity_compensation_force_.load(std::memory_order_relaxed)
+      << " z_gravity_compensation_active="
+      << static_cast<int>(debug_z_gravity_compensation_active_)
+      << " positive_x_compensation_force="
+      << runtime_positive_x_compensation_force_.load(std::memory_order_relaxed)
+      << " positive_x_compensation_active="
+      << static_cast<int>(debug_positive_x_compensation_active_)
       << " translational_damping=" << translational_damping_
       << " rotational_stiffness=" << rotational_stiffness_
       << " rotational_damping=" << rotational_damping_
@@ -924,6 +1065,21 @@ void SerlCartesianImpedanceController::publish_status(const rclcpp::Time& time) 
   }
   for (size_t i = 0; i < 7; ++i) {
     out << " tau_command_" << (i + 1) << "=" << last_tau_command_(i);
+  }
+  for (size_t i = 0; i < 7; ++i) {
+    out << " tau_J_" << (i + 1) << "=" << debug_tau_j_(i);
+  }
+  for (size_t i = 0; i < 7; ++i) {
+    out << " tau_J_d_" << (i + 1) << "=" << debug_tau_j_d_(i);
+  }
+  for (size_t i = 0; i < 7; ++i) {
+    out << " tau_ext_hat_filtered_" << (i + 1) << "=" << debug_tau_ext_hat_filtered_(i);
+  }
+  for (size_t i = 0; i < 6; ++i) {
+    out << " O_F_ext_hat_K_" << i << "=" << debug_o_f_ext_hat_k_(i);
+  }
+  for (size_t i = 0; i < 6; ++i) {
+    out << " K_F_ext_hat_K_" << i << "=" << debug_k_f_ext_hat_k_(i);
   }
   for (size_t i = 0; i < 7; ++i) {
     out << " q_" << (i + 1) << "=" << q_(i);

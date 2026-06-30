@@ -1,0 +1,47 @@
+# Legacy teleop motion-shaping mode archived before direct target mode became
+# the default. This mode used deadzone/power shaping plus velocity,
+# acceleration, jerk, per-step, and workspace limits.
+
+spacemouse_franka_impedance_teleop_server:
+  ros__parameters:
+    direct_target_mode: false
+
+    speed_scale: 10.0
+    spacemouse_target_scale: 1.0
+    normal_spacemouse_target_scale: 2.0
+    fine_spacemouse_target_scale: 1.0
+    translation_deadzone: 0.06
+    rotation_deadzone: 0.10
+    input_power: 3.0
+    max_action_norm: 1.0
+
+    coarse_v_xy_max: 0.03
+    coarse_v_z_up_max: 0.03
+    coarse_v_z_down_max: 0.02
+    coarse_a_xy_max: 0.10
+    coarse_a_z_up_max: 0.10
+    coarse_a_z_down_max: 0.03
+    coarse_j_xy_max: 1.0
+    coarse_j_z_up_max: 1.0
+    coarse_j_z_down_max: 3.0
+
+    fine_v_xy_max: 0.001
+    fine_v_z_up_max: 0.001
+    fine_v_z_down_max: 0.0005
+    fine_a_xy_max: 0.004
+    fine_a_z_up_max: 0.004
+    fine_a_z_down_max: 0.0015
+    fine_j_xy_max: 0.040
+    fine_j_z_up_max: 0.040
+    fine_j_z_down_max: 0.015
+
+    d_move: 3.0
+    d_stop: 5.0
+    dt_nominal: 0.004
+    dt_max: 0.020
+    delta_xy_max: 0.00020
+    delta_z_up_max: 0.00020
+    delta_z_down_max: 0.00020
+    workspace_slowdown_distance: 0.030
+    workspace_low: [0.25, -0.20, 0.04]
+    workspace_high: [0.75, 0.25, 0.75]
