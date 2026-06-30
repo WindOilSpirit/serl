@@ -30,7 +30,16 @@ def main(_):
     listener.start()
     assert FLAGS.exp_name in CONFIG_MAPPING, 'Experiment folder not found.'
     config = CONFIG_MAPPING[FLAGS.exp_name]()
-    env = config.get_environment(fake_env=False, save_video=False, classifier=False)
+    if hasattr(config, "record_success_fail_ask_on_done"):
+        env = config.get_environment(
+            fake_env=False,
+            save_video=False,
+            classifier=False,
+            ask_on_done=config.record_success_fail_ask_on_done,
+            publish_actions=getattr(config, "record_success_fail_publish_actions", False),
+        )
+    else:
+        env = config.get_environment(fake_env=False, save_video=False, classifier=False)
 
     obs, _ = env.reset()
     successes = []

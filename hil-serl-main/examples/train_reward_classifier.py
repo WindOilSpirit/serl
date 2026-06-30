@@ -40,7 +40,9 @@ def main(_):
         include_label=True,
     )
 
-    success_paths = glob.glob(os.path.join(os.getcwd(), "classifier_data", "*success*.pkl"))
+    success_paths = glob.glob(
+        os.path.join(os.getcwd(), "classifier_data", f"{FLAGS.exp_name}*success*.pkl")
+    )
     for path in success_paths:
         success_data = pkl.load(open(path, "rb"))
         for trans in success_data:
@@ -64,7 +66,9 @@ def main(_):
         capacity=50000,
         include_label=True,
     )
-    failure_paths = glob.glob(os.path.join(os.getcwd(), "classifier_data", "*failure*.pkl"))
+    failure_paths = glob.glob(
+        os.path.join(os.getcwd(), "classifier_data", f"{FLAGS.exp_name}*failure*.pkl")
+    )
     for path in failure_paths:
         failure_data = pkl.load(
             open(path, "rb")
